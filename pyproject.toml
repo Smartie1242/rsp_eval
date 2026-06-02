@@ -1,0 +1,29 @@
+﻿[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rsp"
+version = "0.1.0"
+description = "Reusable CLI package for Resiliparse LID research workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pandas",
+  "numpy",
+  "scikit-learn",
+  "matplotlib",
+  "seaborn",
+  "langcodes",
+  "tldextract",
+]
+
+[project.optional-dependencies]
+detectors = [
+  "datasets",
+  "fasttext",
+  "resiliparse",
+]
+
+[tool.setuptools.packages.find]
+include = ["rsp*"]

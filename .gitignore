@@ -1,0 +1,25 @@
+﻿# Python caches and local environments
+__pycache__/
+*__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Generated research data and outputs
+data/
+extracted/
+results/
+*.csv
+*.jsonl
+
+# Large local detector artifacts
+*.bin
+lid.176.bin
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/

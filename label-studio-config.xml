@@ -1,0 +1,122 @@
+<View>
+  <Text name="text" value="$text"/>
+  <Header value="Document info" />
+  <View style="box-shadow: 2px 2px 5px #999;
+               padding: 20px; margin-top: 2em;
+               border-radius: 5px;">
+    <Header value="Choose language"/>
+    <Choices name="annotated_language" toName="text" choice="single">
+
+      <!-- EXISTING VALUES (DO NOT CHANGE) -->
+      <Choice value="fy" alias="Frisian" />
+      <Choice value="nl" alias="Dutch" />
+      <Choice value="de" alias="German" />
+      <Choice value="en" alias="English" />
+
+      <!-- Remaining languages -->
+      <Choice value="es" alias="Spanish" />
+      <Choice value="fr" alias="French" />
+      <Choice value="zh" alias="Chinese" />
+      <Choice value="ru" alias="Russian" />
+      <Choice value="pt" alias="Portuguese" />
+      <Choice value="it" alias="Italian" />
+      <Choice value="ar" alias="Arabic" />
+      <Choice value="ja" alias="Japanese" />
+      <Choice value="tr" alias="Turkish" />
+      <Choice value="id" alias="Indonesian" />
+      <Choice value="pl" alias="Polish" />
+      <Choice value="fa" alias="Persian" />
+      <Choice value="he" alias="Hebrew" />
+      <Choice value="vi" alias="Vietnamese" />
+      <Choice value="sv" alias="Swedish" />
+      <Choice value="ko" alias="Korean" />
+      <Choice value="hi" alias="Hindi" />
+      <Choice value="uk" alias="Ukrainian" />
+      <Choice value="ro" alias="Romanian" />
+      <Choice value="cs" alias="Czech" />
+      <Choice value="no" alias="Norwegian" />
+      <Choice value="fi" alias="Finnish" />
+      <Choice value="hu" alias="Hungarian" />
+      <Choice value="da" alias="Danish" />
+      <Choice value="th" alias="Thai" />
+      <Choice value="ca" alias="Catalan" />
+      <Choice value="bn" alias="Bengali" />
+      <Choice value="el" alias="Greek" />
+      <Choice value="bg" alias="Bulgarian" />
+      <Choice value="sr" alias="Serbian" />
+      <Choice value="hr" alias="Croatian" />
+      <Choice value="az" alias="Azerbaijani" />
+      <Choice value="sk" alias="Slovak" />
+      <Choice value="sl" alias="Slovenian" />
+      <Choice value="ta" alias="Tamil" />
+      <Choice value="eo" alias="Esperanto" />
+      <Choice value="lt" alias="Lithuanian" />
+      <Choice value="et" alias="Estonian" />
+      <Choice value="ml" alias="Malayalam" />
+      <Choice value="la" alias="Latin" />
+      <Choice value="af" alias="Afrikaans" />
+      <Choice value="mr" alias="Marathi" />
+      <Choice value="sq" alias="Albanian" />
+      <Choice value="ur" alias="Urdu" />
+      <Choice value="ka" alias="Georgian" />
+      <Choice value="eu" alias="Basque" />
+      <Choice value="gl" alias="Galician" />
+      <Choice value="tl" alias="Tagalog" />
+      <Choice value="hy" alias="Armenian" />
+      <Choice value="kk" alias="Kazakh" />
+      <Choice value="be" alias="Belarusian" />
+      <Choice value="te" alias="Telugu" />
+      <Choice value="lv" alias="Latvian" />
+      <Choice value="mk" alias="Macedonian" />
+      <Choice value="my" alias="Burmese" />
+      <Choice value="is" alias="Icelandic" />
+      <Choice value="mn" alias="Mongolian" />
+      <Choice value="kn" alias="Kannada" />
+      <Choice value="cy" alias="Welsh" />
+      <Choice value="br" alias="Breton" />
+      <Choice value="uz" alias="Uzbek" />
+      <Choice value="gu" alias="Gujarati" />
+      <Choice value="ne" alias="Nepali" />
+      <Choice value="si" alias="Sinhala" />
+      <Choice value="lb" alias="Luxembourgish" />
+      <Choice value="jv" alias="Javanese" />
+      <Choice value="sw" alias="Swahili" />
+      <Choice value="ga" alias="Irish" />
+      <Choice value="ku" alias="Kurdish" />
+      <Choice value="yi" alias="Yiddish" />
+      <Choice value="tt" alias="Tatar" />
+      <Choice value="pa" alias="Punjabi" />
+      <Choice value="km" alias="Khmer" />
+      <Choice value="tg" alias="Tajik" />
+      <Choice value="sa" alias="Sanskrit" />
+      <Choice value="ba" alias="Bashkir" />
+      <Choice value="io" alias="Ido" />
+      <Choice value="as" alias="Assamese" />
+      <Choice value="vo" alias="Volapük" />
+      <Choice value="ky" alias="Kyrgyz" />
+      <Choice value="so" alias="Somali" />
+      <Choice value="cv" alias="Chuvash" />
+      <Choice value="or" alias="Odia" />
+      <Choice value="ce" alias="Chechen" />
+      <Choice value="mg" alias="Malagasy" />
+      <Choice value="ps" alias="Pashto" />
+      <Choice value="fo" alias="Faroese" />
+      <Choice value="bo" alias="Tibetan" />
+      <Choice value="gd" alias="Scottish Gaelic" />
+      <Choice value="tk" alias="Turkmen" />
+      <Choice value="dv" alias="Divehi" />
+      <Choice value="sc" alias="Sardinian" />
+      <Choice value="mt" alias="Maltese" />
+      <Choice value="ug" alias="Uyghur" />
+      <Choice value="rm" alias="Romansh" />
+      <Choice value="ha" alias="Hausa" />
+      <Choice value="sd" alias="Sindhi" />
+
+      <!-- Special labels -->
+      <Choice value="other" alias="Other" />
+      <Choice value="mixed" alias="Mixed languages" />
+      <Choice value="unknown" alias="Unknown" />
+
+    </Choices>
+  </View>
+</View>
