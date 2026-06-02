@@ -47,6 +47,5 @@ The package expects datasets and generated outputs in the working directory that
 
 Use `label-studio-config.xml` when creating the Label Studio project for OWI Slice annotation. Use `reservoir.awk` to sample fixed-size OWI candidate slices before annotation preparation.
 
-## License
+## License`r`n`r`nThis software is released under the MIT License. See `LICENSE`.
 
-No standalone license has been selected yet. Add a license before publishing the repository publicly.
