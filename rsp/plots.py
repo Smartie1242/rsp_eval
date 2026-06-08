@@ -8,27 +8,49 @@ import os
 from .languages import safe_tag_distance
 
 
-MODEL_ORDER = ["Resiliparse", "FastText", "URL", "RP+FastText", "RP+URL"]
+MODEL_ORDER = [
+    "Resiliparse",
+    "FastText",
+    "URL",
+    "RP+FastText",
+    "RP+URL",
+    "RP+FastText lang-aware",
+    "RP+URL lang-aware",
+    "RP+FastText+URL split-trigger",
+    "RP+FastText+URL lang-aware",
+]
 MODEL_COLORS = {
     "Resiliparse": "#1f77b4",
     "FastText": "#d62728",
     "URL": "#2ca02c",
     "RP+FastText": "#9467bd",
-    "RP+URL": "#ff7f0e",
+    "RP+URL": "#bcbd22",
+    "RP+FastText lang-aware": "#ff7f0e",
+    "RP+URL lang-aware": "#e377c2",
+    "RP+FastText+URL split-trigger": "#8c564b",
+    "RP+FastText+URL lang-aware": "#17becf",
 }
 MODEL_LINESTYLES = {
     "Resiliparse": "-",
     "FastText": "--",
     "URL": ":",
     "RP+FastText": "-.",
-    "RP+URL": (0, (5, 2)),
+    "RP+URL": (0, (4, 2)),
+    "RP+FastText lang-aware": (0, (5, 2)),
+    "RP+URL lang-aware": (0, (2, 1)),
+    "RP+FastText+URL split-trigger": (0, (3, 1, 1, 1)),
+    "RP+FastText+URL lang-aware": (0, (1, 1)),
 }
 MODEL_MARKERS = {
     "Resiliparse": "o",
     "FastText": "s",
     "URL": "^",
     "RP+FastText": "D",
-    "RP+URL": "X",
+    "RP+URL": "h",
+    "RP+FastText lang-aware": "X",
+    "RP+URL lang-aware": "<",
+    "RP+FastText+URL split-trigger": ">",
+    "RP+FastText+URL lang-aware": "v",
 }
 
 
@@ -222,6 +244,20 @@ def plot_length_comparison(results_df, name, out_dir):
         plot_df = results_df.copy()
         bins = list(dict.fromkeys(plot_df["text_length_bin"].astype(str)))
         x_positions = {label: index for index, label in enumerate(bins)}
+        support_by_bin = (
+            plot_df.assign(text_length_bin=plot_df["text_length_bin"].astype(str))
+            .groupby("text_length_bin")["support"]
+            .max()
+            .to_dict()
+            if "support" in plot_df.columns
+            else {}
+        )
+        x_labels = [
+            f"{label}\nn={int(support_by_bin[label]):,}"
+            if label in support_by_bin and support_by_bin[label] == support_by_bin[label]
+            else label
+            for label in bins
+        ]
         models = ordered_models(plot_df["model"].dropna().astype(str))
         offsets = model_marker_offsets(models)
         palette = model_palette(models)
@@ -253,7 +289,7 @@ def plot_length_comparison(results_df, name, out_dir):
         ax.set_ylabel(ylabel)
         ax.set_title(title)
         ax.set_xticks(range(len(bins)))
-        ax.set_xticklabels(bins, rotation=35, ha="right")
+        ax.set_xticklabels(x_labels, rotation=0, ha="center")
         style_model_axis(ax)
         ax.legend(loc="best")
         fig.tight_layout()
@@ -280,11 +316,10 @@ def plot_cutoff_comparison(results_df, dataset_name, dataset_output):
     import seaborn as sns
 
     plt.figure(figsize=(7, 5))
-    sns.lineplot(data=results_df, x="cutoff", y="system_ft_f1", label="RP + FastText", color="tab:blue", linestyle="-")
-    sns.lineplot(data=results_df, x="cutoff", y="system_ft_lang_f1", label="RP + FastText (lang-aware)", color="tab:blue", linestyle=":")
-    sns.lineplot(data=results_df, x="cutoff", y="system_url_f1", label="RP + URL", color="tab:orange", linestyle="-")
-    sns.lineplot(data=results_df, x="cutoff", y="system_url_lang_f1", label="RP + URL (lang-aware)", color="tab:orange", linestyle=":")
-    sns.lineplot(data=results_df, x="cutoff", y="base_rp_f1", label="RP only", color="black", linestyle="--")
+    sns.lineplot(data=results_df, x="cutoff", y="resiliparse_f1", label="Resiliparse", color="tab:blue", linestyle="-")
+    sns.lineplot(data=results_df, x="cutoff", y="fasttext_f1", label="FastText", color="tab:red", linestyle="--")
+    sns.lineplot(data=results_df, x="cutoff", y="system_ft_f1", label="RP+FastText", color="tab:purple", linestyle="-.")
+    sns.lineplot(data=results_df, x="cutoff", y="system_ft_lang_f1", label="RP+FastText lang-aware", color="tab:orange", linestyle=":")
     plt.xlabel("Resiliparse cutoff")
     plt.ylabel("Macro F1")
     plt.title(f"{dataset_name} - Routing comparison")
@@ -293,11 +328,10 @@ def plot_cutoff_comparison(results_df, dataset_name, dataset_output):
     plt.close()
 
     plt.figure(figsize=(7, 5))
-    sns.lineplot(data=results_df, x="cutoff", y="system_ft_acc", label="RP + FastText", color="tab:blue", linestyle="-")
-    sns.lineplot(data=results_df, x="cutoff", y="system_ft_lang_acc", label="RP + FastText (lang-aware)", color="tab:blue", linestyle=":")
-    sns.lineplot(data=results_df, x="cutoff", y="system_url_acc", label="RP + URL", color="tab:orange", linestyle="-")
-    sns.lineplot(data=results_df, x="cutoff", y="system_url_lang_acc", label="RP + URL (lang-aware)", color="tab:orange", linestyle=":")
-    sns.lineplot(data=results_df, x="cutoff", y="rp_acc", label="RP only", color="black", linestyle="--")
+    sns.lineplot(data=results_df, x="cutoff", y="resiliparse_acc", label="Resiliparse", color="tab:blue", linestyle="-")
+    sns.lineplot(data=results_df, x="cutoff", y="fasttext_acc", label="FastText", color="tab:red", linestyle="--")
+    sns.lineplot(data=results_df, x="cutoff", y="system_ft_acc", label="RP+FastText", color="tab:purple", linestyle="-.")
+    sns.lineplot(data=results_df, x="cutoff", y="system_ft_lang_acc", label="RP+FastText lang-aware", color="tab:orange", linestyle=":")
     plt.xlabel("Resiliparse cutoff")
     plt.ylabel("Accuracy")
     plt.title(f"{dataset_name} - Routing comparison (Accuracy)")

@@ -6,7 +6,7 @@ import argparse
 import os
 
 from ..datasets import load_csv, resolve_dataset_paths
-from ..metrics import add_k_score_features, add_k_score_features_ft, compute_summary
+from ..metrics import add_k_score_features, add_k_score_features_ft, compute_summary, filter_evaluation_rows
 from ..plots import (
     plot_gap_vs_lang_distance,
     plot_histogram,
@@ -17,7 +17,7 @@ from ..plots import (
 
 def process_dataset(dataset_name, csv_path, output_dir, plot_type="all"):
     print(f"Processing {dataset_name}")
-    df = load_csv(csv_path)
+    df = filter_evaluation_rows(load_csv(csv_path), dataset_name)
     dfs = [("rp", add_k_score_features(df)), ("ft", add_k_score_features_ft(df))]
     dataset_output = os.path.join(output_dir, dataset_name)
     os.makedirs(dataset_output, exist_ok=True)
@@ -75,4 +75,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-

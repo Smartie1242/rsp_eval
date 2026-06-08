@@ -8,6 +8,9 @@ from typing import Dict, List, Optional
 from .languages import OWI_LABEL_TO_ISO3, normalize_to_iso3
 
 
+EXCLUDED_OWI_EVALUATION_LABELS = {"mixed languages", "mixed", "unknown"}
+
+
 class DatasetExtractor(ABC):
     """Abstract base class for extracting text, labels, URLs, and metadata."""
 
@@ -128,7 +131,11 @@ class OWIExtractor(DatasetExtractor):
             if not choices:
                 return None
 
-            return self.mapping.get(choices[0])
+            label = choices[0]
+            if str(label).strip().lower() in EXCLUDED_OWI_EVALUATION_LABELS:
+                return None
+
+            return self.mapping.get(label)
         except (KeyError, IndexError, TypeError):
             return None
 
@@ -217,4 +224,3 @@ def get_extractor(extractor_type: str, **kwargs) -> DatasetExtractor:
             metadata_headers=kwargs.get("metadata_headers"),
         )
     raise ValueError(f"Unknown extractor type: {extractor_type}")
-

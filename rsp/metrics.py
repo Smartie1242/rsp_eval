@@ -5,14 +5,89 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
+UNEVALUABLE_LANGUAGE_VALUES = {"unknown", "unk", "none", "mixed", "", None}
+EXCLUDED_EVALUATION_LABELS = {"mixed", "unknown"}
+WILI_SOURCE_DATASET = "WiLI_2018"
+WILI_EVAL_OVERLAP_DATASET = "WiLI_2018_eval_overlap"
+
+
+def filter_evaluation_rows(df, dataset: str = "", label_column: str = "label"):
+    """Drop labels that cannot be evaluated by single-label LID models."""
+    if label_column not in df.columns:
+        return df
+
+    before = len(df)
+    labels = df[label_column].fillna("unknown").astype(str).str.lower()
+    filtered = df[~labels.isin(EXCLUDED_EVALUATION_LABELS)].copy().reset_index(drop=True)
+    dropped = before - len(filtered)
+    if dropped:
+        prefix = f"{dataset}: " if dataset else ""
+        print(f"[filter] {prefix}dropped {dropped:,} unevaluable row(s)")
+    return filtered
+
+
+def is_wili_dataset_name(dataset: str) -> bool:
+    """Return whether a dataset name refers to the WiLI source or filtered view."""
+    return str(dataset) in {WILI_SOURCE_DATASET, WILI_EVAL_OVERLAP_DATASET}
+
+
+def filter_wili_eval_overlap_frames(
+    frames,
+    label_column: str = "label",
+    rename_wili: bool = True,
+):
+    """Filter WiLI to the gold-label universe covered by the other evaluation datasets.
+
+    The source WiLI output is intentionally left unchanged on disk. This helper
+    creates the publication-facing comparison view used by tables and figures:
+    WiLI labels are retained only when they also appear as gold labels in the
+    non-WiLI evaluation datasets.
+    """
+    if not frames:
+        return frames, set()
+
+    label_universe = set()
+    wili_names = []
+    for dataset, df in frames.items():
+        if label_column not in df.columns:
+            continue
+        if is_wili_dataset_name(dataset):
+            wili_names.append(dataset)
+            continue
+        labels = df[label_column].fillna("unknown").astype(str).str.lower()
+        label_universe.update(labels[~labels.isin(EXCLUDED_EVALUATION_LABELS)])
+
+    if not wili_names or not label_universe:
+        return frames, label_universe
+
+    filtered_frames = {}
+    for dataset, df in frames.items():
+        if not is_wili_dataset_name(dataset):
+            filtered_frames[dataset] = df.reset_index(drop=True)
+            continue
+
+        labels = df[label_column].fillna("unknown").astype(str).str.lower()
+        retained = df[labels.isin(label_universe)].copy().reset_index(drop=True)
+        retained_labels = retained[label_column].fillna("unknown").astype(str).str.lower().nunique()
+        output_name = WILI_EVAL_OVERLAP_DATASET if rename_wili else dataset
+        print(
+            "[filter] "
+            f"{dataset}: retained {len(retained):,}/{len(df):,} row(s) "
+            f"across {retained_labels:,} label(s) for thesis evaluation overlap"
+        )
+        filtered_frames[output_name] = retained
+
+    return filtered_frames, label_universe
+
 
 def safe_f1(y_true, y_pred):
-    """Macro F1 that returns 0.0 for empty inputs."""
+    """Closed-set macro F1 over the gold labels that returns 0.0 for empty inputs."""
     if len(y_true) == 0:
         return 0.0
     from sklearn.metrics import f1_score
 
-    return f1_score(y_true, y_pred, average="macro", zero_division=0)
+    labels = sorted(set(y_true))
+    return f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
 
 
 def safe_accuracy(y_true, y_pred):
@@ -167,4 +242,3 @@ def get_text_bin(length: int) -> str:
         if low <= length < high:
             return label
     return "unknown"
-

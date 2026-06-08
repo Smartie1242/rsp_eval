@@ -6,13 +6,29 @@ import argparse
 import os
 
 from ..datasets import load_csv, resolve_dataset_paths
+from ..metrics import filter_evaluation_rows
 from ..plots import plot_cutoff_comparison
 from ..routing import SCORE_CUTOFFS, evaluate_score_cutoff
 
 
+def has_url_metadata(dataset_name: str) -> bool:
+    return str(dataset_name).startswith("OWI_slice")
+
+
+def drop_url_columns_for_non_url_dataset(results_df, dataset_name):
+    if has_url_metadata(dataset_name):
+        return results_df
+    url_columns = [
+        column
+        for column in results_df.columns
+        if "_url" in column.lower() or column.lower().startswith("url_")
+    ]
+    return results_df.drop(columns=url_columns)
+
+
 def process_dataset(dataset_name, csv_path, output_dir):
     print(f"\nProcessing dataset: {dataset_name}")
-    df = load_csv(csv_path)
+    df = filter_evaluation_rows(load_csv(csv_path), dataset_name)
     dataset_output = os.path.join(output_dir, dataset_name)
     os.makedirs(dataset_output, exist_ok=True)
 
@@ -24,6 +40,7 @@ def process_dataset(dataset_name, csv_path, output_dir):
     import pandas as pd
 
     results_df = pd.DataFrame(results)
+    results_df = drop_url_columns_for_non_url_dataset(results_df, dataset_name)
     results_df.to_csv(os.path.join(dataset_output, "cutoff_sweep.csv"), index=False)
     print(f"  Saved results for {dataset_name}")
     plot_cutoff_comparison(results_df, dataset_name, dataset_output)
@@ -59,4 +76,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-

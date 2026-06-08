@@ -57,34 +57,55 @@ TLD_TO_LANG = {
 }
 
 
-def detect_url_lang(url: str):
-    """Return a `(language, confidence)` hint from URL subdomain or TLD."""
-    suffix, subdomain = extract_url_parts(url)
+def detect_url_lang(url: str) -> tuple[str, float]:
+    """
+    Return a (language, confidence) hint from URL structure.
 
-    if subdomain:
-        prefix = subdomain.split(".")[0]
+    Detection order:
+        1. Language subdomain (fy.example.com)
+        2. Language path segment (/fy/, /fy-NL/, /zh-Hans/)
+        3. Country-code TLD (.nl, .de, .fr)
+        4. Fallback to English
+    """
+    parsed = urlparse(url if "://" in url else f"//{url}")
+
+    host = (parsed.hostname or "").lower()
+    parts = host.split(".")
+
+    if len(parts) >= 3:
+        prefix = parts[0]
         if prefix in SUPPORTED_LANGS:
             return prefix, 0.95
 
-    if suffix in TLD_TO_LANG:
-        return TLD_TO_LANG[suffix], 0.80
+    path_lang = extract_path_language(parsed.path)
+    if path_lang:
+        return path_lang, 0.90
 
-    return "unknown", 0.0
+    if len(parts) >= 2:
+        lang = TLD_TO_LANG.get(parts[-1])
+        if lang:
+            return lang, 0.80
+
+    return "en", 0.05
 
 
-def extract_url_parts(url: str) -> tuple[str, str]:
-    """Extract `(suffix, subdomain)` with tldextract when available."""
-    try:
-        import tldextract
-    except ModuleNotFoundError:
-        parsed = urlparse(url if "://" in url else f"//{url}")
-        host = (parsed.hostname or "").lower()
-        parts = host.split(".")
-        if len(parts) < 2:
-            return "", ""
-        suffix = parts[-1]
-        subdomain = ".".join(parts[:-2])
-        return suffix, subdomain
+def extract_path_language(path: str) -> str:
+    """
+    Detect language codes from path segments.
+    """
+    for segment in path.lower().split("/"):
+        if len(segment) < 2:
+            continue
 
-    ext = tldextract.extract(url)
-    return (ext.suffix or "").lower(), (ext.subdomain or "").lower()
+        lang = segment[:2]
+
+        if lang not in SUPPORTED_LANGS:
+            continue
+
+        if len(segment) == 2:
+            return lang
+
+        if segment[2:3] in ("-", "_"):
+            return lang
+
+    return ""

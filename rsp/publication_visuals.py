@@ -20,7 +20,16 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
-from .languages import safe_tag_distance
+from .languages import OWI_LABEL_TO_ISO3, safe_tag_distance
+from .metrics import (
+    UNEVALUABLE_LANGUAGE_VALUES,
+    WILI_EVAL_OVERLAP_DATASET,
+    WILI_SOURCE_DATASET,
+    filter_evaluation_rows,
+    filter_wili_eval_overlap_frames,
+    is_wili_dataset_name,
+)
+from .routing import combined_url_fasttext_decision, split_trigger_url_fasttext_decision
 
 
 # =============================================================================
@@ -39,6 +48,7 @@ TEXT_LENGTH_DIRNAME = "text_length"
 RESOURCE_LEVEL_DIRNAME = "resource_levels"
 RUNTIME_DIRNAME = "runtime"
 LANGUAGE_SIMILARITY_DIRNAME = "language_similarity"
+SUMMARY_PLOTS_DIRNAME = "summary_plots"
 
 RP_OUTPUT_FILES = {
     "OWI_slice_dutch": Path("extracted/OWI_slice/dutch/rp_outputs.csv"),
@@ -54,7 +64,7 @@ LENGTH_SWEEP_FILES = {
     "OWI_slice_frisian": Path("results/length_sweep/OWI_slice_frisian/length_sweep.csv"),
     "OWI_slice_random": Path("results/length_sweep/OWI_slice_random/length_sweep.csv"),
     "GLC": Path("results/length_sweep/GLC/length_sweep.csv"),
-    "WiLI_2018": Path("results/length_sweep/WiLI_2018/length_sweep.csv"),
+    "WiLI_2018_eval_overlap": Path("results/length_sweep/WiLI_2018_eval_overlap/length_sweep.csv"),
     "CommonLID": Path("results/length_sweep/commonlid/length_sweep.csv"),
 }
 
@@ -62,7 +72,7 @@ HYBRID_CUTOFF = 1200.0
 LANG_AWARE_DISTANCE_THRESHOLD = 30
 HIGH_RESOURCE_ARTICLES = 1_000_000
 LOW_RESOURCE_ARTICLES = 100_000
-INCLUDE_UNKNOWN_RESOURCE = False
+INCLUDE_UNKNOWN_RESOURCE = True
 
 MODEL_DEFINITIONS = {
     "Resiliparse": "rank_1_lang_rp",
@@ -73,16 +83,22 @@ MODEL_DEFINITIONS = {
 EXTENDED_MODEL_ORDER = [
     "Resiliparse",
     "FastText",
-    "URL",
     "RP+FastText",
     "RP+URL",
     "RP+FastText lang-aware",
     "RP+URL lang-aware",
+    "RP+FastText+URL lang-aware",
+    "RP+FastText+URL split-trigger",
 ]
 
-# Wikipedia article counts are deliberately editable. Values below cover common
-# languages in the current repository outputs; unknown languages are categorized
-# as "unknown" resource level.
+# Resource-level grouping is intentionally limited to languages supported by the
+# local detector pipeline. Counts are deliberately editable; supported languages
+# without a local count are shown as "unknown" resource level.
+RESILIPARSE_SUPPORTED_LANGUAGE_CODES = {
+    code
+    for code in OWI_LABEL_TO_ISO3.values()
+    if code not in {"mixed", "unknown", "other"}
+}
 WIKIPEDIA_ARTICLE_COUNTS = {
     "eng": 6_900_000,
     "deu": 2_900_000,
@@ -118,6 +134,15 @@ WIKIPEDIA_ARTICLE_COUNTS = {
     "bjn": 4_000,
     "glk": 10_000,
     "lez": 12_000,
+}
+
+FASTTEXT_SUPPORTED_LANGUAGE_CODES = set(WIKIPEDIA_ARTICLE_COUNTS)
+RESOURCE_SUPPORTED_LANGUAGE_CODES = RESILIPARSE_SUPPORTED_LANGUAGE_CODES | FASTTEXT_SUPPORTED_LANGUAGE_CODES
+
+SUPPORTED_WIKIPEDIA_ARTICLE_COUNTS = {
+    language: count
+    for language, count in WIKIPEDIA_ARTICLE_COUNTS.items()
+    if language in RESOURCE_SUPPORTED_LANGUAGE_CODES
 }
 
 LANGUAGE_FAMILIES = {
@@ -158,6 +183,7 @@ REQUIRED_LENGTH_SWEEP_COLUMNS = {
     "accuracy",
     "f1_macro",
 }
+TEXT_LENGTH_PLOT_MODELS = {"Resiliparse", "FastText", "RP+FastText"}
 
 REQUIRED_RUNTIME_COLUMNS = {
     "runtime_rp",
@@ -169,9 +195,20 @@ REQUIRED_LANGUAGE_SIMILARITY_COLUMNS = {
     "rank_1_lang_rp",
     "rank_2_lang_rp",
     "rank_1_oop_score",
+    "rank_2_oop_score",
 }
 
-BAD_LANGUAGE_VALUES = {"unknown", "unk", "none", "", None}
+EXCLUDED_EVALUATION_LABELS = {"mixed", "unknown"}
+URL_EVALUATION_MODEL_ORDER = [
+    "Always English",
+    "URL",
+    "Resiliparse",
+    "FastText",
+    "RP+URL",
+    "RP+URL lang-aware",
+    "RP+FastText+URL lang-aware",
+    "RP+FastText+URL split-trigger",
+]
 
 
 # =============================================================================
@@ -189,6 +226,16 @@ def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", str(value)).strip("_")
 
 
+def has_url_metadata(dataset: str) -> bool:
+    """Return whether a dataset has meaningful URL metadata for URL models."""
+    return str(dataset).startswith("OWI_slice")
+
+
+def is_url_model(model: str) -> bool:
+    """Return whether a model depends on URL-derived language."""
+    return "URL" in str(model)
+
+
 def language_family(language: str) -> str:
     for family, languages in LANGUAGE_FAMILIES.items():
         if language in languages:
@@ -197,7 +244,9 @@ def language_family(language: str) -> str:
 
 
 def resource_level(language: str) -> str:
-    count = WIKIPEDIA_ARTICLE_COUNTS.get(language)
+    if language not in RESOURCE_SUPPORTED_LANGUAGE_CODES:
+        return "unknown"
+    count = SUPPORTED_WIKIPEDIA_ARTICLE_COUNTS.get(language)
     if count is None:
         return "unknown"
     if count >= HIGH_RESOURCE_ARTICLES:
@@ -219,13 +268,105 @@ def require_columns(df, required: set[str], path: Path) -> None:
         raise ValueError(f"{path} is missing required columns: {', '.join(missing)}")
 
 
+def dataset_display_label(dataset: str) -> str:
+    """Return the thesis-facing display name for dataset identifiers."""
+    if dataset == WILI_EVAL_OVERLAP_DATASET:
+        return "WiLI_Filtered"
+    if dataset == WILI_SOURCE_DATASET:
+        return "WiLI-2018"
+    return str(dataset)
+
+
+def filter_normalized_wili_eval_overlap(metrics_df, confusion_df):
+    """Apply the WiLI evaluation-overlap view to pre-normalized input tables."""
+    import pandas as pd
+
+    label_universe = set()
+    if confusion_df is not None and not confusion_df.empty and "true_label" in confusion_df.columns:
+        non_wili = ~confusion_df["dataset"].astype(str).map(is_wili_dataset_name)
+        labels = confusion_df.loc[non_wili, "true_label"].fillna("unknown").astype(str).str.lower()
+        label_universe.update(labels[~labels.isin(EXCLUDED_EVALUATION_LABELS)])
+    if metrics_df is not None and not metrics_df.empty and "language" in metrics_df.columns:
+        non_wili = ~metrics_df["dataset"].astype(str).map(is_wili_dataset_name)
+        labels = metrics_df.loc[non_wili, "language"].fillna("unknown").astype(str).str.lower()
+        label_universe.update(labels[~labels.isin(EXCLUDED_EVALUATION_LABELS)])
+
+    if not label_universe:
+        return metrics_df, confusion_df
+
+    if metrics_df is not None and not metrics_df.empty and "language" in metrics_df.columns:
+        wili_mask = metrics_df["dataset"].astype(str).map(is_wili_dataset_name)
+        keep_mask = ~wili_mask | metrics_df["language"].fillna("unknown").astype(str).str.lower().isin(label_universe)
+        before = int(wili_mask.sum())
+        metrics_df = metrics_df[keep_mask].copy()
+        metrics_df.loc[metrics_df["dataset"].astype(str).map(is_wili_dataset_name), "dataset"] = WILI_EVAL_OVERLAP_DATASET
+        after = int((metrics_df["dataset"] == WILI_EVAL_OVERLAP_DATASET).sum())
+        if before:
+            log("filter", f"{WILI_SOURCE_DATASET}: retained {after:,}/{before:,} normalized metric row(s)")
+
+    if confusion_df is not None and not confusion_df.empty and "true_label" in confusion_df.columns:
+        wili_mask = confusion_df["dataset"].astype(str).map(is_wili_dataset_name)
+        keep_mask = ~wili_mask | confusion_df["true_label"].fillna("unknown").astype(str).str.lower().isin(label_universe)
+        before = int(wili_mask.sum())
+        confusion_df = confusion_df[keep_mask].copy()
+        confusion_df.loc[confusion_df["dataset"].astype(str).map(is_wili_dataset_name), "dataset"] = WILI_EVAL_OVERLAP_DATASET
+        after = int((confusion_df["dataset"] == WILI_EVAL_OVERLAP_DATASET).sum())
+        if before:
+            log("filter", f"{WILI_SOURCE_DATASET}: retained {after:,}/{before:,} normalized confusion row(s)")
+
+    return metrics_df, confusion_df
+
+
+def prepare_wili_eval_overlap_frames(frames: dict[str, object]):
+    """Filter loaded rp_outputs frames to the publication-facing WiLI view."""
+    filtered_frames, label_universe = filter_wili_eval_overlap_frames(frames)
+    if label_universe:
+        log("filter", f"evaluation universe: {len(label_universe):,} non-WiLI label(s)")
+    return filtered_frames
+
+
+def filter_confusion_rows(confusion_df):
+    """Drop unevaluable true-label rows from normalized confusion data."""
+    if confusion_df is None or confusion_df.empty or "true_label" not in confusion_df.columns:
+        return confusion_df
+
+    before = len(confusion_df)
+    labels = confusion_df["true_label"].fillna("unknown").astype(str).str.lower()
+    confusion_df = confusion_df[~labels.isin(EXCLUDED_EVALUATION_LABELS)].copy()
+    dropped = before - len(confusion_df)
+    if dropped:
+        log("filter", f"dropped {dropped:,} unevaluable confusion row(s)")
+    return confusion_df
+
+
+def filter_metrics_rows(metrics_df):
+    """Drop unevaluable language rows from normalized metric data."""
+    if metrics_df is None or metrics_df.empty or "language" not in metrics_df.columns:
+        return metrics_df
+
+    before = len(metrics_df)
+    labels = metrics_df["language"].fillna("unknown").astype(str).str.lower()
+    metrics_df = metrics_df[~labels.isin(EXCLUDED_EVALUATION_LABELS)].copy()
+    dropped = before - len(metrics_df)
+    if dropped:
+        log("filter", f"dropped {dropped:,} unevaluable metric row(s)")
+    return metrics_df
+
+
 def model_predictions(df, model: str, cutoff: float):
     import numpy as np
 
     if model == "RP+FastText":
         scores = df["rank_1_oop_score"].fillna(math.inf).astype(float)
-        return np.where(scores >= cutoff, df["rank_1_lang_ft"], df["rank_1_lang_rp"])
+        fallback = scores >= cutoff
+        return np.where(fallback, df["rank_1_lang_ft"], df["rank_1_lang_rp"])
     return df[MODEL_DEFINITIONS[model]]
+
+
+def rank_distance_trigger_mask(df, lang_threshold: int = LANG_AWARE_DISTANCE_THRESHOLD):
+    distances = df.apply(lambda row: safe_tag_distance(row["rank_1_lang_rp"], row["rank_2_lang_rp"]), axis=1)
+    safe_distance = distances < 100
+    return (~safe_distance) | (distances > lang_threshold)
 
 
 def extended_model_predictions(df, model: str, cutoff: float, lang_threshold: int = LANG_AWARE_DISTANCE_THRESHOLD):
@@ -236,23 +377,27 @@ def extended_model_predictions(df, model: str, cutoff: float, lang_threshold: in
         return df["rank_1_lang_rp"]
     if model == "FastText":
         return df["rank_1_lang_ft"]
-    if model == "URL":
-        return df["lang_url"]
 
     scores = pd.to_numeric(df["rank_1_oop_score"], errors="coerce").fillna(math.inf)
     cutoff_fallback = scores >= cutoff
     if model == "RP+FastText":
-        return np.where(cutoff_fallback, df["rank_1_lang_ft"], df["rank_1_lang_rp"])
+        fallback = cutoff_fallback
+        return np.where(fallback, df["rank_1_lang_ft"], df["rank_1_lang_rp"])
     if model == "RP+URL":
-        return np.where(cutoff_fallback, df["lang_url"], df["rank_1_lang_rp"])
+        fallback = cutoff_fallback
+        return np.where(fallback, df["lang_url"], df["rank_1_lang_rp"])
 
-    distances = df.apply(lambda row: safe_tag_distance(row["rank_1_lang_rp"], row["rank_2_lang_rp"]), axis=1)
-    distance_fallback = distances > lang_threshold
-    fallback = cutoff_fallback | distance_fallback
+    distance_fallback = rank_distance_trigger_mask(df, lang_threshold)
     if model == "RP+FastText lang-aware":
+        fallback = cutoff_fallback | distance_fallback
         return np.where(fallback, df["rank_1_lang_ft"], df["rank_1_lang_rp"])
     if model == "RP+URL lang-aware":
+        fallback = cutoff_fallback | distance_fallback
         return np.where(fallback, df["lang_url"], df["rank_1_lang_rp"])
+    if model == "RP+FastText+URL lang-aware":
+        return combined_url_fasttext_decision(df, cutoff, lang_threshold)["prediction"]
+    if model == "RP+FastText+URL split-trigger":
+        return split_trigger_url_fasttext_decision(df, cutoff, lang_threshold)["prediction"]
     raise ValueError(f"Unknown extended model: {model}")
 
 
@@ -272,11 +417,33 @@ def model_runtime_seconds(df, model: str, cutoff: float):
         return runtime_url
 
     scores = pd.to_numeric(df["rank_1_oop_score"], errors="coerce").fillna(math.inf)
-    fallback = scores >= cutoff
+    cutoff_fallback = scores >= cutoff
     if model == "RP+FastText":
+        fallback = cutoff_fallback
         return runtime_rp + pd.Series(np.where(fallback, runtime_ft, 0.0), index=df.index)
     if model == "RP+URL":
+        fallback = cutoff_fallback
         return runtime_rp + pd.Series(np.where(fallback, runtime_url, 0.0), index=df.index)
+    if model == "RP+FastText lang-aware":
+        fallback = cutoff_fallback | rank_distance_trigger_mask(df)
+        return runtime_rp + pd.Series(np.where(fallback, runtime_ft, 0.0), index=df.index)
+    if model == "RP+URL lang-aware":
+        fallback = cutoff_fallback | rank_distance_trigger_mask(df)
+        return runtime_rp + pd.Series(np.where(fallback, runtime_url, 0.0), index=df.index)
+    if model == "RP+FastText+URL lang-aware":
+        decision = combined_url_fasttext_decision(df, cutoff)
+        return (
+            runtime_rp
+            + pd.Series(np.where(decision["fallback"], runtime_url, 0.0), index=df.index)
+            + pd.Series(np.where(decision["use_fasttext"], runtime_ft, 0.0), index=df.index)
+        )
+    if model == "RP+FastText+URL split-trigger":
+        decision = split_trigger_url_fasttext_decision(df, cutoff)
+        return (
+            runtime_rp
+            + pd.Series(np.where(decision["use_url"], runtime_url, 0.0), index=df.index)
+            + pd.Series(np.where(decision["use_fasttext"], runtime_ft, 0.0), index=df.index)
+        )
     raise ValueError(f"Unknown runtime model: {model}")
 
 
@@ -284,6 +451,7 @@ def derive_confusion_from_rp_outputs(paths: dict[str, Path], hybrid_cutoff: floa
     import pandas as pd
 
     rows = []
+    frames = {}
     log("derive", f"{len(paths)} configured rp_outputs file(s)")
     for dataset, path in paths.items():
         if not path.exists():
@@ -299,7 +467,11 @@ def derive_confusion_from_rp_outputs(paths: dict[str, Path], hybrid_cutoff: floa
         df["label"] = df["label"].fillna("unknown").astype(str)
         df["rank_1_lang_rp"] = df["rank_1_lang_rp"].fillna("unknown").astype(str)
         df["rank_1_lang_ft"] = df["rank_1_lang_ft"].fillna("unknown").astype(str)
+        df = filter_evaluation_rows(df, dataset)
+        frames[dataset] = df
 
+    frames = prepare_wili_eval_overlap_frames(frames)
+    for dataset, df in frames.items():
         for model in MODEL_DEFINITIONS:
             log("derive", f"{dataset} / {model}")
             pred = pd.Series(model_predictions(df, model, hybrid_cutoff)).fillna("unknown").astype(str)
@@ -325,6 +497,7 @@ def derive_extended_confusion_from_rp_outputs(paths: dict[str, Path], hybrid_cut
     import pandas as pd
 
     rows = []
+    frames = {}
     log("derive", f"extended summary from {len(paths)} rp_outputs file(s)")
     for dataset, path in paths.items():
         if not path.exists():
@@ -346,16 +519,20 @@ def derive_extended_confusion_from_rp_outputs(paths: dict[str, Path], hybrid_cut
             df["lang_url"] = df["lang_url"].fillna("unknown").astype(str)
         if "rank_2_lang_rp" in df.columns:
             df["rank_2_lang_rp"] = df["rank_2_lang_rp"].fillna("unknown").astype(str)
+        df = filter_evaluation_rows(df, dataset)
+        frames[dataset] = df
 
+    frames = prepare_wili_eval_overlap_frames(frames)
+    for dataset, df in frames.items():
         available_models = list(EXTENDED_MODEL_ORDER)
-        if "lang_url" not in df.columns:
-            available_models = [
-                model for model in available_models if model not in {"URL", "RP+URL", "RP+URL lang-aware"}
-            ]
-            log("skip", f"{dataset}: URL models require lang_url")
+        if "lang_url" not in df.columns or not has_url_metadata(dataset):
+            available_models = [model for model in available_models if "URL" not in model]
+            log("skip", f"{dataset}: URL models require OWI URL metadata")
         if "rank_2_lang_rp" not in df.columns:
             available_models = [
-                model for model in available_models if not model.endswith("lang-aware")
+                model
+                for model in available_models
+                if "lang-aware" not in model and model != "RP+FastText+URL split-trigger"
             ]
             log("skip", f"{dataset}: lang-aware models require rank_2_lang_rp")
 
@@ -385,7 +562,18 @@ def derive_runtime_from_rp_outputs(paths: dict[str, Path], hybrid_cutoff: float)
     import pandas as pd
 
     rows = []
-    runtime_models = ["Resiliparse", "FastText", "URL", "RP+FastText", "RP+URL"]
+    frames = {}
+    runtime_models = [
+        "Resiliparse",
+        "FastText",
+        "URL",
+        "RP+FastText",
+        "RP+URL",
+        "RP+FastText lang-aware",
+        "RP+URL lang-aware",
+        "RP+FastText+URL lang-aware",
+        "RP+FastText+URL split-trigger",
+    ]
     log("runtime", f"{len(paths)} configured rp_outputs file(s)")
     for dataset, path in paths.items():
         if not path.exists():
@@ -398,10 +586,26 @@ def derive_runtime_from_rp_outputs(paths: dict[str, Path], hybrid_cutoff: float)
         except ValueError as exc:
             log("skip", f"{dataset}: incompatible runtime schema ({exc})")
             continue
+        df = filter_evaluation_rows(df, dataset)
+        frames[dataset] = df
 
+    frames = prepare_wili_eval_overlap_frames(frames)
+    for dataset, df in frames.items():
         available_models = list(runtime_models)
         if "runtime_url" not in df.columns:
-            available_models = [model for model in available_models if model not in {"URL", "RP+URL"}]
+            available_models = [
+                model
+                for model in available_models
+                if model not in {"URL", "RP+URL", "RP+URL lang-aware", "RP+FastText+URL split-trigger"}
+            ]
+        if "lang_url" not in df.columns or not has_url_metadata(dataset):
+            available_models = [model for model in available_models if "URL" not in model and model != "URL"]
+        if "rank_2_lang_rp" not in df.columns:
+            available_models = [
+                model
+                for model in available_models
+                if "lang-aware" not in model and model != "RP+FastText+URL split-trigger"
+            ]
 
         for model in available_models:
             runtimes = model_runtime_seconds(df, model, hybrid_cutoff)
@@ -442,7 +646,7 @@ def derive_runtime_from_rp_outputs(paths: dict[str, Path], hybrid_cutoff: float)
 
 @lru_cache(maxsize=512)
 def language_tag_is_valid(value) -> bool:
-    if value in BAD_LANGUAGE_VALUES:
+    if value in UNEVALUABLE_LANGUAGE_VALUES:
         return False
     try:
         from langcodes import tag_distance
@@ -457,6 +661,7 @@ def derive_language_similarity_from_rp_outputs(paths: dict[str, Path]):
     import pandas as pd
 
     rows = []
+    frames = {}
     log("similarity", f"{len(paths)} configured rp_outputs file(s)")
     for dataset, path in paths.items():
         if not path.exists():
@@ -474,11 +679,24 @@ def derive_language_similarity_from_rp_outputs(paths: dict[str, Path]):
             continue
 
         log("similarity", dataset)
+        df = filter_evaluation_rows(df, dataset)
+        frames[dataset] = df
+
+    frames = prepare_wili_eval_overlap_frames(frames)
+    for dataset, df in frames.items():
+        log("similarity", dataset)
         for record in df.itertuples(index=False):
             true_lang = str(getattr(record, "label", "unknown") or "unknown")
             rank_1_lang = str(getattr(record, "rank_1_lang_rp", "unknown") or "unknown")
             rank_2_lang = str(getattr(record, "rank_2_lang_rp", "unknown") or "unknown")
+            rank_3_lang = str(getattr(record, "rank_3_lang_rp", "unknown") or "unknown")
             oop_score = getattr(record, "rank_1_oop_score", math.nan)
+            rank_2_oop_score = getattr(record, "rank_2_oop_score", math.nan)
+            rank_3_oop_score = getattr(record, "rank_3_oop_score", math.nan)
+            oop_score_numeric = pd.to_numeric(oop_score, errors="coerce")
+            rank_2_oop_score_numeric = pd.to_numeric(rank_2_oop_score, errors="coerce")
+            rank_3_oop_score_numeric = pd.to_numeric(rank_3_oop_score, errors="coerce")
+            oop_gap = rank_2_oop_score_numeric - oop_score_numeric
             rank_1_valid = language_tag_is_valid(rank_1_lang)
             rank_2_valid = language_tag_is_valid(rank_2_lang)
             invalid = not (rank_1_valid and rank_2_valid)
@@ -487,23 +705,45 @@ def derive_language_similarity_from_rp_outputs(paths: dict[str, Path]):
             predicted_family = language_family(rank_1_lang)
             rank_1_family = language_family(rank_1_lang)
             rank_2_family = language_family(rank_2_lang)
+            rank_3_family = language_family(rank_3_lang)
+            rank_1_correct = true_lang == rank_1_lang
+            rank_2_correct = true_lang == rank_2_lang
+            rank_3_correct = true_lang == rank_3_lang
+            if rank_1_correct:
+                rank_correctness = "Rank 1 correct"
+            elif rank_2_correct:
+                rank_correctness = "Rank 2 correct"
+            elif rank_3_correct:
+                rank_correctness = "Rank 3 correct"
+            else:
+                rank_correctness = "Neither rank correct"
             rows.append(
                 {
                     "dataset": dataset,
                     "true_lang": true_lang,
                     "rank_1_lang": rank_1_lang,
                     "rank_2_lang": rank_2_lang,
+                    "rank_3_lang": rank_3_lang,
                     "predicted_lang": rank_1_lang,
                     "rank_1_family": rank_1_family,
                     "rank_2_family": rank_2_family,
+                    "rank_3_family": rank_3_family,
                     "true_family": true_family,
                     "predicted_family": predicted_family,
                     "same_rank_family": rank_1_family == rank_2_family,
                     "same_family": true_family == predicted_family,
-                    "is_correct": true_lang == rank_1_lang,
+                    "is_correct": rank_1_correct,
+                    "rank_1_correct": rank_1_correct,
+                    "rank_2_correct": rank_2_correct,
+                    "rank_3_correct": rank_3_correct,
+                    "rank_correctness": rank_correctness,
                     "rank_1_rank_2_distance": distance,
                     "lang_distance": distance,
-                    "rank_1_oop_score": oop_score,
+                    "rank_1_oop_score": oop_score_numeric,
+                    "rank_2_oop_score": rank_2_oop_score_numeric,
+                    "rank_3_oop_score": rank_3_oop_score_numeric,
+                    "rank_1_rank_2_oop_gap": oop_gap,
+                    "oop_gap_invalid": pd.isna(oop_gap),
                     "rank_distance_invalid": invalid,
                     "lang_distance_invalid": invalid,
                 }
@@ -517,17 +757,27 @@ def derive_language_similarity_from_rp_outputs(paths: dict[str, Path]):
                 "true_lang",
                 "rank_1_lang",
                 "rank_2_lang",
+                "rank_3_lang",
                 "predicted_lang",
                 "rank_1_family",
                 "rank_2_family",
+                "rank_3_family",
                 "true_family",
                 "predicted_family",
                 "same_rank_family",
                 "same_family",
                 "is_correct",
+                "rank_1_correct",
+                "rank_2_correct",
+                "rank_3_correct",
+                "rank_correctness",
                 "rank_1_rank_2_distance",
                 "lang_distance",
                 "rank_1_oop_score",
+                "rank_2_oop_score",
+                "rank_3_oop_score",
+                "rank_1_rank_2_oop_gap",
+                "oop_gap_invalid",
                 "rank_distance_invalid",
                 "lang_distance_invalid",
             ]
@@ -535,6 +785,11 @@ def derive_language_similarity_from_rp_outputs(paths: dict[str, Path]):
 
     similarity_df = pd.DataFrame(rows)
     similarity_df["rank_1_oop_score"] = pd.to_numeric(similarity_df["rank_1_oop_score"], errors="coerce")
+    similarity_df["rank_2_oop_score"] = pd.to_numeric(similarity_df["rank_2_oop_score"], errors="coerce")
+    if "rank_3_oop_score" in similarity_df.columns:
+        similarity_df["rank_3_oop_score"] = pd.to_numeric(similarity_df["rank_3_oop_score"], errors="coerce")
+    similarity_df["rank_1_rank_2_oop_gap"] = pd.to_numeric(similarity_df["rank_1_rank_2_oop_gap"], errors="coerce")
+    similarity_df["oop_gap_invalid"] = similarity_df["rank_1_rank_2_oop_gap"].isna()
     log("similarity", f"rows: {len(similarity_df):,}")
     return similarity_df
 
@@ -546,7 +801,7 @@ def metrics_from_confusion(confusion_df):
     log("metrics", "computing per-language scores")
     for (dataset, model), group in confusion_df.groupby(["dataset", "model"], sort=True):
         log("metrics", f"{dataset} / {model}")
-        labels = sorted(set(group["true_label"]) | set(group["predicted_label"]))
+        labels = sorted(set(group["true_label"]))
         total = int(group["count"].sum())
 
         for language in sorted(set(group["true_label"])):
@@ -592,7 +847,7 @@ def model_metric_rows_from_confusion(confusion_df):
     """Compute one multiclass metric row per dataset/model from count data."""
     rows = []
     for (dataset, model), group in confusion_df.groupby(["dataset", "model"], sort=True):
-        labels = sorted(set(group["true_label"]) | set(group["predicted_label"]))
+        labels = sorted(set(group["true_label"]))
         total = int(group["count"].sum())
         if total == 0 or not labels:
             continue
@@ -714,6 +969,7 @@ def load_or_derive_inputs(args):
         log("input", "derive from rp_outputs.csv")
         paths = parse_rp_output_overrides(args.rp_output)
         confusion_df = derive_confusion_from_rp_outputs(paths, args.hybrid_cutoff)
+        confusion_df = filter_confusion_rows(confusion_df)
         metrics_df = metrics_from_confusion(confusion_df)
         return metrics_df, confusion_df
 
@@ -728,6 +984,9 @@ def load_or_derive_inputs(args):
     require_columns(confusion_df, REQUIRED_CONFUSION_COLUMNS, confusion_file)
     if "support" not in metrics_df.columns:
         metrics_df["support"] = 1
+    metrics_df = filter_metrics_rows(metrics_df)
+    confusion_df = filter_confusion_rows(confusion_df)
+    metrics_df, confusion_df = filter_normalized_wili_eval_overlap(metrics_df, confusion_df)
     return metrics_df, confusion_df
 
 
@@ -773,6 +1032,175 @@ def format_metric(value: float, best: bool) -> str:
     return formatted
 
 
+def format_plain_value(value, column: str) -> str:
+    """Format non-highlighted table values for compact thesis tables."""
+    if value is None:
+        return "n/a"
+    try:
+        if math.isnan(float(value)):
+            return "n/a"
+    except (TypeError, ValueError):
+        pass
+    if column in {"Accuracy", "F1 (macro)", "F1 (weighted)", "Mean runtime (ms)"}:
+        return f"{float(value):.3f}"
+    if column == "Docs/s":
+        return "n/a" if float(value) == 0.0 else f"{float(value):.1f}"
+    if column in {"Support", "Languages"}:
+        return str(int(value))
+    return latex_escape(value)
+
+
+def write_compact_latex_table(display_df, columns, tex_path: Path, csv_path: Path | None = None) -> None:
+    """Write a compact booktabs table grouped by dataset."""
+    if csv_path is not None:
+        display_df[columns].to_csv(csv_path, index=False)
+        log("saved", f"compact table csv: {csv_path}")
+
+    align = "ll" + ("r" * (len(columns) - 2))
+    with open(tex_path, "w", encoding="utf-8") as handle:
+        handle.write(r"\begin{tabular}{" + align + "}" + "\n")
+        handle.write(r"\toprule" + "\n")
+        handle.write(" & ".join(columns) + r" \\" + "\n")
+        handle.write(r"\midrule" + "\n")
+
+        previous_dataset = None
+        for record in display_df[columns].to_dict("records"):
+            dataset = record["Dataset"]
+            if previous_dataset is not None and previous_dataset != dataset:
+                handle.write(r"\midrule" + "\n")
+            dataset_label = latex_escape(dataset) if previous_dataset != dataset else ""
+            previous_dataset = dataset
+            row_values = [dataset_label, latex_escape(record["Model"])]
+            row_values.extend(format_plain_value(record[column], column) for column in columns[2:])
+            handle.write(" & ".join(row_values) + r" \\" + "\n")
+
+        handle.write(r"\bottomrule" + "\n")
+        handle.write(r"\end{tabular}" + "\n")
+    log("saved", f"compact table: {tex_path}")
+
+
+RANK_CORRECTNESS_ORDER = ["Rank 1 correct", "Rank 2 correct", "Rank 3 correct", "Neither rank correct"]
+OOP_GAP_THRESHOLDS = [10, 25, 50, 100]
+LANG_DISTANCE_BUCKETS = ["<=20", "21-80", "81-100", ">100"]
+
+
+def language_distance_bucket(distance) -> str:
+    value = float(distance)
+    if value <= 20:
+        return "<=20"
+    if value <= 80:
+        return "21-80"
+    if value <= 100:
+        return "81-100"
+    return ">100"
+
+
+def summarize_oop_gap_correctness(similarity_df):
+    import pandas as pd
+
+    if similarity_df is None or similarity_df.empty:
+        return pd.DataFrame()
+
+    gap_df = similarity_df[
+        (~similarity_df["oop_gap_invalid"].astype(bool))
+        & similarity_df["rank_1_rank_2_oop_gap"].notna()
+        & similarity_df["rank_correctness"].notna()
+    ].copy()
+    if gap_df.empty:
+        return pd.DataFrame()
+
+    gap_df["rank_1_rank_2_oop_gap"] = pd.to_numeric(
+        gap_df["rank_1_rank_2_oop_gap"],
+        errors="coerce",
+    )
+    gap_df = gap_df.dropna(subset=["rank_1_rank_2_oop_gap"])
+
+    rows = []
+    for dataset, dataset_group in gap_df.groupby("dataset", sort=True):
+        for correctness in RANK_CORRECTNESS_ORDER:
+            group = dataset_group[dataset_group["rank_correctness"] == correctness]
+            row = {
+                "dataset": dataset,
+                "rank_correctness": correctness,
+                "n": int(len(group)),
+                "median_gap": float(group["rank_1_rank_2_oop_gap"].median()) if not group.empty else math.nan,
+            }
+            for threshold in OOP_GAP_THRESHOLDS:
+                row[f"pct_gap_lte_{threshold}"] = (
+                    float((group["rank_1_rank_2_oop_gap"] <= threshold).mean() * 100)
+                    if not group.empty
+                    else math.nan
+                )
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def format_gap_value(value) -> str:
+    if value is None or math.isnan(float(value)):
+        return "--"
+    return f"{float(value):.1f}"
+
+
+def format_percent_value(value) -> str:
+    if value is None or math.isnan(float(value)):
+        return "--"
+    return f"{float(value):.1f}\\%"
+
+
+def write_oop_gap_correctness_table(table_df, tex_path: Path, include_dataset: bool) -> None:
+    columns = [
+        "N",
+        "Median gap",
+        r"\% gap $\leq$ 10",
+        r"\% gap $\leq$ 25",
+        r"\% gap $\leq$ 50",
+        r"\% gap $\leq$ 100",
+    ]
+    with open(tex_path, "w", encoding="utf-8") as handle:
+        if include_dataset:
+            handle.write(r"\begin{tabular}{llrrrrrr}" + "\n")
+            handle.write(r"\toprule" + "\n")
+            handle.write("Dataset & Rank correctness & " + " & ".join(columns) + r" \\" + "\n")
+        else:
+            handle.write(r"\begin{tabular}{lrrrrrr}" + "\n")
+            handle.write(r"\toprule" + "\n")
+            handle.write("Rank correctness & " + " & ".join(columns) + r" \\" + "\n")
+        handle.write(r"\midrule" + "\n")
+
+        previous_dataset = None
+        for record in table_df.itertuples(index=False):
+            if include_dataset and previous_dataset is not None and previous_dataset != record.dataset:
+                handle.write(r"\midrule" + "\n")
+            values = [
+                str(int(record.n)),
+                format_gap_value(record.median_gap),
+                format_percent_value(record.pct_gap_lte_10),
+                format_percent_value(record.pct_gap_lte_25),
+                format_percent_value(record.pct_gap_lte_50),
+                format_percent_value(record.pct_gap_lte_100),
+            ]
+            if include_dataset:
+                dataset_label = latex_escape(dataset_display_label(record.dataset)) if previous_dataset != record.dataset else ""
+                previous_dataset = record.dataset
+                handle.write(
+                    f"{dataset_label} & {latex_escape(record.rank_correctness)} & "
+                    + " & ".join(values)
+                    + r" \\"
+                    + "\n"
+                )
+            else:
+                handle.write(
+                    f"{latex_escape(record.rank_correctness)} & "
+                    + " & ".join(values)
+                    + r" \\"
+                    + "\n"
+                )
+
+        handle.write(r"\bottomrule" + "\n")
+        handle.write(r"\end{tabular}" + "\n")
+
+
 def write_baseline_table(metrics_df, output_dir: Path):
     log("table", "baseline")
     tables_dir = output_dir / TABLES_DIRNAME
@@ -809,7 +1237,7 @@ def write_baseline_table(metrics_df, output_dir: Path):
         for record in table_df.sort_values(["dataset", "model", "resource_level"]).itertuples(index=False):
             if previous_dataset is not None and previous_dataset != record.dataset:
                 handle.write(r"\midrule" + "\n")
-            dataset_label = latex_escape(record.dataset) if previous_dataset != record.dataset else ""
+            dataset_label = latex_escape(dataset_display_label(record.dataset)) if previous_dataset != record.dataset else ""
             previous_dataset = record.dataset
 
             values = []
@@ -832,11 +1260,19 @@ def write_baseline_table(metrics_df, output_dir: Path):
     log("saved", f"baseline: {output_path}")
 
 
-def write_model_dataset_summary(confusion_df, output_dir: Path):
+def write_model_dataset_summary(confusion_df, output_dir: Path, runtime_df=None):
     log("table", "model dataset summary")
     tables_dir = output_dir / TABLES_DIRNAME
     tables_dir.mkdir(parents=True, exist_ok=True)
     table_df = model_metric_rows_from_confusion(confusion_df)
+    include_runtime = runtime_df is not None and not runtime_df.empty
+    if include_runtime:
+        runtime_cols = ["dataset", "model", "mean_seconds", "docs_per_second"]
+        runtime_table = runtime_df[runtime_cols].copy()
+        runtime_table["mean_runtime_ms"] = runtime_table["mean_seconds"] * 1000
+        runtime_table = runtime_table.drop(columns=["mean_seconds"])
+        runtime_table = runtime_table[["dataset", "model", "mean_runtime_ms", "docs_per_second"]]
+        table_df = table_df.merge(runtime_table, on=["dataset", "model"], how="left")
     log("table", f"model rows: {len(table_df):,}")
 
     csv_path = tables_dir / "model_dataset_summary.csv"
@@ -859,21 +1295,20 @@ def write_model_dataset_summary(confusion_df, output_dir: Path):
 
     output_path = tables_dir / "model_dataset_summary.tex"
     with open(output_path, "w", encoding="utf-8") as handle:
-        handle.write(r"\begin{tabular}{llrrrrrrr}" + "\n")
+        column_spec = "llrrrrrrr" + ("rr" if include_runtime else "")
+        handle.write(r"\begin{tabular}{" + column_spec + "}" + "\n")
         handle.write(r"\toprule" + "\n")
-        handle.write(
-            "Dataset & Model & "
-            + " & ".join(labels[col] for col in metric_cols)
-            + r" & Support & Languages \\"
-            + "\n"
-        )
+        header_cols = ["Dataset", "Model", *[labels[col] for col in metric_cols], "Support", "Languages"]
+        if include_runtime:
+            header_cols.extend(["Mean runtime (ms)", "Docs/s"])
+        handle.write(" & ".join(header_cols) + r" \\" + "\n")
         handle.write(r"\midrule" + "\n")
 
         previous_dataset = None
         for record in table_df.sort_values(["dataset", "model"]).itertuples(index=False):
             if previous_dataset is not None and previous_dataset != record.dataset:
                 handle.write(r"\midrule" + "\n")
-            dataset_label = latex_escape(record.dataset) if previous_dataset != record.dataset else ""
+            dataset_label = latex_escape(dataset_display_label(record.dataset)) if previous_dataset != record.dataset else ""
             previous_dataset = record.dataset
 
             values = []
@@ -885,7 +1320,13 @@ def write_model_dataset_summary(confusion_df, output_dir: Path):
             handle.write(
                 f"{dataset_label} & {latex_escape(record.model)} & "
                 + " & ".join(values)
-                + f" & {int(record.support)} & {int(record.languages)} "
+                + f" & {int(record.support)} & {int(record.languages)}"
+                + (
+                    f" & {float(record.mean_runtime_ms):.3f} & {float(record.docs_per_second):.1f}"
+                    if include_runtime and not math.isnan(float(record.mean_runtime_ms))
+                    else (" & n/a & n/a" if include_runtime else "")
+                )
+                + " "
                 + r"\\"
                 + "\n"
             )
@@ -894,6 +1335,53 @@ def write_model_dataset_summary(confusion_df, output_dir: Path):
         handle.write(r"\end{tabular}" + "\n")
 
     log("saved", f"model summary: {output_path}")
+
+    write_model_dataset_summary_splits(table_df, output_dir)
+
+
+def write_model_dataset_summary_splits(table_df, output_dir: Path):
+    """Write compact thesis-facing baseline performance/runtime tables."""
+    tables_dir = output_dir / TABLES_DIRNAME
+    display_df = table_df.rename(
+        columns={
+            "dataset": "Dataset",
+            "model": "Model",
+            "accuracy": "Accuracy",
+            "f1_macro": "F1 (macro)",
+            "f1_weighted": "F1 (weighted)",
+            "support": "Support",
+            "languages": "Languages",
+            "mean_runtime_ms": "Mean runtime (ms)",
+            "docs_per_second": "Docs/s",
+        }
+    ).copy()
+    display_df["Dataset"] = display_df["Dataset"].map(dataset_display_label)
+    display_df = display_df.sort_values(["Dataset", "Model"])
+
+    performance_columns = [
+        "Dataset",
+        "Model",
+        "Accuracy",
+        "F1 (macro)",
+        "F1 (weighted)",
+        "Support",
+        "Languages",
+    ]
+    write_compact_latex_table(
+        display_df,
+        performance_columns,
+        tables_dir / "model_dataset_performance_summary.tex",
+        tables_dir / "model_dataset_performance_summary.csv",
+    )
+
+    if {"Mean runtime (ms)", "Docs/s"}.issubset(display_df.columns):
+        runtime_columns = ["Dataset", "Model", "Mean runtime (ms)", "Docs/s"]
+        write_compact_latex_table(
+            display_df,
+            runtime_columns,
+            tables_dir / "model_dataset_runtime_summary.tex",
+            tables_dir / "model_dataset_runtime_summary.csv",
+        )
 
 
 def write_model_dataset_summary_extended(confusion_df, output_dir: Path):
@@ -946,7 +1434,7 @@ def write_model_dataset_summary_extended(confusion_df, output_dir: Path):
         for record in table_df.sort_values(["dataset", "_model_order", "model"]).itertuples(index=False):
             if previous_dataset is not None and previous_dataset != record.dataset:
                 handle.write(r"\midrule" + "\n")
-            dataset_label = latex_escape(record.dataset) if previous_dataset != record.dataset else ""
+            dataset_label = latex_escape(dataset_display_label(record.dataset)) if previous_dataset != record.dataset else ""
             previous_dataset = record.dataset
 
             values = []
@@ -967,6 +1455,447 @@ def write_model_dataset_summary_extended(confusion_df, output_dir: Path):
         handle.write(r"\end{tabular}" + "\n")
 
     log("saved", f"extended model summary: {output_path}")
+
+    write_extended_summary_splits(table_df, output_dir)
+
+
+def write_extended_summary_splits(table_df, output_dir: Path):
+    """Write compact thesis-facing adapted-system summary splits."""
+    tables_dir = output_dir / TABLES_DIRNAME
+    display_df = table_df.rename(
+        columns={
+            "dataset": "Dataset",
+            "model": "Model",
+            "accuracy": "Accuracy",
+            "f1_macro": "F1 (macro)",
+            "f1_weighted": "F1 (weighted)",
+            "support": "Support",
+            "languages": "Languages",
+        }
+    ).copy()
+    display_df["Dataset"] = display_df["Dataset"].map(dataset_display_label)
+
+    model_order = {model: index for index, model in enumerate(EXTENDED_MODEL_ORDER)}
+    display_df["_model_order"] = display_df["Model"].map(lambda model: model_order.get(model, len(model_order)))
+    display_df = display_df.sort_values(["Dataset", "_model_order", "Model"])
+    columns = [
+        "Dataset",
+        "Model",
+        "Accuracy",
+        "F1 (macro)",
+        "F1 (weighted)",
+        "Support",
+        "Languages",
+    ]
+
+    frisian_df = display_df[display_df["Dataset"] == "OWI_slice_frisian"].drop(columns=["_model_order"])
+    if not frisian_df.empty:
+        write_compact_latex_table(
+            frisian_df,
+            columns,
+            tables_dir / "adapted_owi_frisian_summary.tex",
+            tables_dir / "adapted_owi_frisian_summary.csv",
+        )
+
+    control_df = display_df[display_df["Dataset"] != "OWI_slice_frisian"].drop(columns=["_model_order"])
+    if not control_df.empty:
+        write_compact_latex_table(
+            control_df,
+            columns,
+            tables_dir / "adapted_cross_dataset_summary.tex",
+            tables_dir / "adapted_cross_dataset_summary.csv",
+        )
+
+
+def _annotate_bar_values(ax, values):
+    for patch, value in zip(ax.patches, values):
+        if math.isnan(value):
+            continue
+        ax.annotate(
+            f"{value:.0%}",
+            (patch.get_x() + patch.get_width() / 2, patch.get_height()),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            xytext=(0, 3),
+            textcoords="offset points",
+        )
+
+
+def write_adaptation_ladder_plot(output_dir: Path):
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    from .plots import MODEL_COLORS
+
+    tables_dir = output_dir / TABLES_DIRNAME
+    summary_path = tables_dir / "model_dataset_summary_extended.csv"
+    if not summary_path.exists():
+        log("skip", f"adaptation ladder: missing {summary_path}")
+        return
+
+    df = pd.read_csv(summary_path)
+    dataset = "OWI_slice_frisian"
+    ladder_order = [
+        "Resiliparse",
+        "RP+FastText",
+        "RP+URL",
+        "RP+FastText lang-aware",
+        "RP+URL lang-aware",
+        "RP+FastText+URL split-trigger",
+        "RP+FastText+URL lang-aware",
+        "FastText",
+    ]
+    plot_df = df[(df["dataset"] == dataset) & (df["model"].isin(ladder_order))].copy()
+    if plot_df.empty:
+        log("skip", f"adaptation ladder: no {dataset} rows")
+        return
+
+    plot_df["model"] = pd.Categorical(plot_df["model"], categories=ladder_order, ordered=True)
+    plot_df = plot_df.sort_values("model")
+    models = plot_df["model"].astype(str).tolist()
+    x = list(range(len(plot_df)))
+
+    summary_dir = output_dir / SUMMARY_PLOTS_DIRNAME
+    summary_dir.mkdir(parents=True, exist_ok=True)
+
+    log("summary", "OWI Frisian adaptation ladder")
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8), sharey=True)
+    for ax, metric, title in [
+        (axes[0], "accuracy", "Accuracy"),
+        (axes[1], "f1_macro", "Macro F1"),
+    ]:
+        values = plot_df[metric].astype(float).tolist()
+        colors = [MODEL_COLORS.get(model, "#7f7f7f") for model in models]
+        ax.bar(x, values, color=colors, edgecolor="black", linewidth=0.6)
+        _annotate_bar_values(ax, values)
+        ax.set_title(title)
+        ax.set_ylim(0, 1.05)
+        ax.set_xticks(x)
+        ax.set_xticklabels(models, rotation=35, ha="right")
+        ax.grid(axis="y", linestyle=":", linewidth=0.7, alpha=0.7)
+        ax.set_ylabel("Score")
+
+    fig.suptitle("OWI Frisian adapted-model performance ladder")
+    fig.tight_layout()
+    output_path = summary_dir / "owi_frisian_adaptation_ladder.pdf"
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    log("saved", f"summary: {output_path}")
+
+
+def write_clean_vs_web_gap_plot(output_dir: Path):
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    from .plots import MODEL_COLORS
+
+    tables_dir = output_dir / TABLES_DIRNAME
+    summary_path = tables_dir / "model_dataset_summary.csv"
+    if not summary_path.exists():
+        log("skip", f"clean/web gap: missing {summary_path}")
+        return
+
+    df = pd.read_csv(summary_path)
+    dataset_order = [
+        "WiLI_2018_eval_overlap",
+        "GLC",
+        "CommonLID",
+        "OWI_slice_dutch",
+        "OWI_slice_frisian",
+        "OWI_slice_random",
+    ]
+    label_map = {
+        "WiLI_2018_eval_overlap": "WiLI_Filtered",
+        "GLC": "GLC\ncontrolled",
+        "CommonLID": "CommonLID\nweb",
+        "OWI_slice_dutch": "OWI Dutch\nweb",
+        "OWI_slice_frisian": "OWI Frisian\nweb",
+        "OWI_slice_random": "OWI Random\nweb",
+    }
+    plot_df = df[(df["model"] == "Resiliparse") & (df["dataset"].isin(dataset_order))].copy()
+    if plot_df.empty:
+        log("skip", "clean/web gap: no Resiliparse rows")
+        return
+
+    plot_df["dataset"] = pd.Categorical(plot_df["dataset"], categories=dataset_order, ordered=True)
+    plot_df = plot_df.sort_values("dataset")
+    labels = [label_map.get(dataset, dataset) for dataset in plot_df["dataset"].astype(str)]
+    x = list(range(len(plot_df)))
+
+    summary_dir = output_dir / SUMMARY_PLOTS_DIRNAME
+    summary_dir.mkdir(parents=True, exist_ok=True)
+
+    log("summary", "Resiliparse clean vs web gap")
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8), sharey=True)
+    colors = []
+    for dataset in plot_df["dataset"].astype(str):
+        if dataset in {"WiLI_2018_eval_overlap", "GLC"}:
+            colors.append(MODEL_COLORS["Resiliparse"])
+        else:
+            colors.append("#ff7f0e")
+
+    for ax, metric, title in [
+        (axes[0], "accuracy", "Accuracy"),
+        (axes[1], "f1_macro", "Macro F1"),
+    ]:
+        values = plot_df[metric].astype(float).tolist()
+        ax.bar(x, values, color=colors, edgecolor="black", linewidth=0.6)
+        _annotate_bar_values(ax, values)
+        ax.axvline(1.5, color="#555555", linestyle="--", linewidth=0.9)
+        ax.text(0.2, 1.01, "clean / controlled", transform=ax.get_xaxis_transform(), fontsize=8)
+        ax.text(2.15, 1.01, "web", transform=ax.get_xaxis_transform(), fontsize=8)
+        ax.set_title(title)
+        ax.set_ylim(0, 1.05)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=25, ha="right")
+        ax.grid(axis="y", linestyle=":", linewidth=0.7, alpha=0.7)
+        ax.set_ylabel("Score")
+
+    fig.suptitle("Resiliparse performance gap between filtered clean/controlled and web datasets")
+    fig.tight_layout()
+    output_path = summary_dir / "resiliparse_clean_vs_web_gap.pdf"
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    log("saved", f"summary: {output_path}")
+
+
+def write_summary_plots(output_dir: Path):
+    write_adaptation_ladder_plot(output_dir)
+    write_clean_vs_web_gap_plot(output_dir)
+
+
+def summarize_seconds(seconds):
+    documents = int(seconds.count())
+    total_seconds = float(seconds.sum()) if documents else 0.0
+    mean_seconds = float(seconds.mean()) if documents else math.nan
+    docs_per_second = documents / total_seconds if total_seconds > 0 else math.nan
+    return mean_seconds, docs_per_second
+
+
+def derive_url_model_evaluation(paths: dict[str, Path], hybrid_cutoff: float):
+    import numpy as np
+    import pandas as pd
+
+    confusion_rows = []
+    runtime_rows = []
+    log("table", "url model evaluation")
+    for dataset, path in paths.items():
+        if not has_url_metadata(dataset):
+            log("skip", f"{dataset}: URL/model evaluation is limited to OWI slices")
+            continue
+        if not path.exists():
+            log("skip", f"{dataset}: missing URL evaluation source {path}")
+            continue
+
+        df = pd.read_csv(path)
+        needed = {"label", "rank_1_lang_rp", "rank_1_lang_ft", "lang_url", "rank_1_oop_score"}
+        try:
+            require_columns(df, needed, path)
+        except ValueError as exc:
+            log("skip", f"{dataset}: incompatible URL evaluation schema ({exc})")
+            continue
+
+        df = df.copy()
+        for column in ["label", "rank_1_lang_rp", "rank_1_lang_ft", "lang_url"]:
+            df[column] = df[column].fillna("unknown").astype(str)
+        if "rank_2_lang_rp" in df.columns:
+            df["rank_2_lang_rp"] = df["rank_2_lang_rp"].fillna("unknown").astype(str)
+        df = filter_evaluation_rows(df, dataset)
+        if df.empty:
+            log("skip", f"{dataset}: no evaluable URL/model rows")
+            continue
+
+        prediction_sources = {
+            "Always English": pd.Series(np.repeat("eng", len(df)), index=df.index),
+            "URL": df["lang_url"],
+            "Resiliparse": df["rank_1_lang_rp"],
+            "FastText": df["rank_1_lang_ft"],
+            "RP+URL": pd.Series(
+                extended_model_predictions(df, "RP+URL", hybrid_cutoff),
+                index=df.index,
+            ),
+        }
+        if "rank_2_lang_rp" in df.columns:
+            prediction_sources["RP+URL lang-aware"] = pd.Series(
+                extended_model_predictions(df, "RP+URL lang-aware", hybrid_cutoff),
+                index=df.index,
+            )
+            prediction_sources["RP+FastText+URL lang-aware"] = pd.Series(
+                extended_model_predictions(df, "RP+FastText+URL lang-aware", hybrid_cutoff),
+                index=df.index,
+            )
+            prediction_sources["RP+FastText+URL split-trigger"] = pd.Series(
+                extended_model_predictions(df, "RP+FastText+URL split-trigger", hybrid_cutoff),
+                index=df.index,
+            )
+        else:
+            log("skip", f"{dataset}: combined UrlExtractor/FastText composite requires rank_2_lang_rp")
+
+        for model in URL_EVALUATION_MODEL_ORDER:
+            if model not in prediction_sources:
+                continue
+            pred = pd.Series(prediction_sources[model], index=df.index).fillna("unknown").astype(str)
+            counts = (
+                pd.DataFrame({"true_label": df["label"], "predicted_label": pred})
+                .groupby(["true_label", "predicted_label"])
+                .size()
+                .reset_index(name="count")
+            )
+            counts.insert(0, "model", model)
+            counts.insert(0, "dataset", dataset)
+            confusion_rows.append(counts)
+
+            if model == "Always English":
+                runtimes = pd.Series(np.repeat(0.0, len(df)), index=df.index)
+            elif model == "URL":
+                runtimes = pd.to_numeric(df.get("runtime_url", 0.0), errors="coerce").fillna(0.0)
+            elif model == "Resiliparse":
+                runtimes = model_runtime_seconds(df, "Resiliparse", hybrid_cutoff)
+            elif model == "FastText":
+                runtimes = model_runtime_seconds(df, "FastText", hybrid_cutoff)
+            elif model == "RP+URL":
+                runtimes = model_runtime_seconds(df, "RP+URL", hybrid_cutoff)
+            elif model == "RP+URL lang-aware":
+                runtimes = model_runtime_seconds(df, "RP+URL lang-aware", hybrid_cutoff)
+            elif model == "RP+FastText+URL split-trigger":
+                runtimes = model_runtime_seconds(df, "RP+FastText+URL split-trigger", hybrid_cutoff)
+            else:
+                runtimes = model_runtime_seconds(df, "RP+FastText+URL lang-aware", hybrid_cutoff)
+            mean_seconds, docs_per_second = summarize_seconds(runtimes)
+            runtime_rows.append(
+                {
+                    "dataset": dataset,
+                    "model": model,
+                    "mean_runtime_ms": mean_seconds * 1000 if not math.isnan(mean_seconds) else math.nan,
+                    "docs_per_second": docs_per_second,
+                }
+            )
+
+    if not confusion_rows:
+        log("skip", "URL/model evaluation: no compatible rows")
+        return None
+
+    confusion_df = pd.concat(confusion_rows, ignore_index=True)
+    metrics_df = model_metric_rows_from_confusion(confusion_df)
+    runtime_df = pd.DataFrame(runtime_rows)
+    table_df = metrics_df.merge(runtime_df, on=["dataset", "model"], how="left")
+    model_order = {model: index for index, model in enumerate(URL_EVALUATION_MODEL_ORDER)}
+    return table_df.assign(
+        _model_order=table_df["model"].map(lambda model: model_order.get(model, len(model_order)))
+    ).sort_values(["dataset", "_model_order", "model"]).drop(columns=["_model_order"])
+
+
+def write_url_model_evaluation_table(paths: dict[str, Path], output_dir: Path, hybrid_cutoff: float):
+    table_df = derive_url_model_evaluation(paths, hybrid_cutoff)
+    if table_df is None or table_df.empty:
+        return
+
+    tables_dir = output_dir / TABLES_DIRNAME
+    tables_dir.mkdir(parents=True, exist_ok=True)
+
+    display_df = table_df.rename(
+        columns={
+            "dataset": "Dataset",
+            "model": "Model",
+            "accuracy": "Accuracy",
+            "precision_macro": "Precision (macro)",
+            "recall_macro": "Recall (macro)",
+            "f1_macro": "F1 (macro)",
+            "f1_weighted": "F1 (weighted)",
+            "support": "Support",
+            "languages": "Languages",
+            "mean_runtime_ms": "Mean runtime (ms)",
+            "docs_per_second": "Docs/s",
+        }
+    )
+    display_df["Dataset"] = display_df["Dataset"].map(dataset_display_label)
+    columns = [
+        "Dataset",
+        "Model",
+        "Accuracy",
+        "Precision (macro)",
+        "Recall (macro)",
+        "F1 (macro)",
+        "F1 (weighted)",
+        "Support",
+        "Languages",
+        "Mean runtime (ms)",
+        "Docs/s",
+    ]
+    csv_path = tables_dir / "url_model_evaluation.csv"
+    display_df[columns].to_csv(csv_path, index=False)
+    log("saved", f"URL/model evaluation csv: {csv_path}")
+
+    tex_path = tables_dir / "url_model_evaluation.tex"
+    metric_cols = ["Accuracy", "Precision (macro)", "Recall (macro)", "F1 (macro)", "F1 (weighted)"]
+    with open(tex_path, "w", encoding="utf-8") as handle:
+        handle.write(r"\begin{tabular}{llrrrrrrrrr}" + "\n")
+        handle.write(r"\toprule" + "\n")
+        handle.write(
+            r"Dataset & Model & Accuracy & Precision (macro) & Recall (macro) & F1 (macro) & F1 (weighted) & Support & Languages & Mean runtime (ms) & Docs/s \\"
+            + "\n"
+        )
+        handle.write(r"\midrule" + "\n")
+
+        previous_dataset = None
+        for record in display_df[columns].to_dict("records"):
+            dataset = record["Dataset"]
+            if previous_dataset is not None and previous_dataset != dataset:
+                handle.write(r"\midrule" + "\n")
+            dataset_label = latex_escape(dataset_display_label(dataset)) if previous_dataset != dataset else ""
+            previous_dataset = dataset
+            values = [format_metric(float(record[col]), False) for col in metric_cols]
+            mean_ms = record["Mean runtime (ms)"]
+            docs_s = record["Docs/s"]
+            mean_ms_text = f"{float(mean_ms):.3f}" if not math.isnan(float(mean_ms)) else "n/a"
+            docs_s_text = f"{float(docs_s):.1f}" if not math.isnan(float(docs_s)) else "n/a"
+            handle.write(
+                f"{dataset_label} & {latex_escape(record['Model'])} & "
+                + " & ".join(values)
+                + f" & {int(record['Support'])} & {int(record['Languages'])}"
+                + f" & {mean_ms_text} & {docs_s_text} "
+                + r"\\"
+                + "\n"
+            )
+
+        handle.write(r"\bottomrule" + "\n")
+        handle.write(r"\end{tabular}" + "\n")
+
+    log("saved", f"URL/model evaluation: {tex_path}")
+
+    write_url_model_evaluation_splits(display_df, output_dir)
+
+
+def write_url_model_evaluation_splits(display_df, output_dir: Path):
+    """Write compact URL/model evaluation tables for target and control slices."""
+    tables_dir = output_dir / TABLES_DIRNAME
+    columns = [
+        "Dataset",
+        "Model",
+        "Accuracy",
+        "F1 (macro)",
+        "F1 (weighted)",
+        "Support",
+        "Mean runtime (ms)",
+        "Docs/s",
+    ]
+
+    frisian_df = display_df[display_df["Dataset"] == "OWI_slice_frisian"].copy()
+    if not frisian_df.empty:
+        write_compact_latex_table(
+            frisian_df,
+            columns,
+            tables_dir / "url_model_evaluation_frisian.tex",
+            tables_dir / "url_model_evaluation_frisian.csv",
+        )
+
+    controls_df = display_df[display_df["Dataset"].isin(["OWI_slice_dutch", "OWI_slice_random"])].copy()
+    if not controls_df.empty:
+        write_compact_latex_table(
+            controls_df,
+            columns,
+            tables_dir / "url_model_evaluation_controls.tex",
+            tables_dir / "url_model_evaluation_controls.csv",
+        )
 
 
 def write_resource_level_summary_table(metrics_df, output_dir: Path):
@@ -1010,7 +1939,7 @@ def write_resource_level_summary_table(metrics_df, output_dir: Path):
         for record in table_df.sort_values(["dataset", "resource_level", "model"]).itertuples(index=False):
             if previous_dataset is not None and previous_dataset != record.dataset:
                 handle.write(r"\midrule" + "\n")
-            dataset_label = latex_escape(record.dataset) if previous_dataset != record.dataset else ""
+            dataset_label = latex_escape(dataset_display_label(record.dataset)) if previous_dataset != record.dataset else ""
             previous_dataset = record.dataset
 
             values = []
@@ -1049,8 +1978,9 @@ def write_resource_level_plots(metrics_df, output_dir: Path):
     if table_df.empty:
         log("skip", "resource levels: no non-unknown rows")
         return
+    table_df = table_df.assign(dataset_label=table_df["dataset"].map(dataset_display_label))
 
-    levels = [level for level in ["low", "mid", "high"] if level in set(table_df["resource_level"])]
+    levels = [level for level in ["low", "mid", "high", "unknown"] if level in set(table_df["resource_level"])]
     models = ordered_models(table_df["model"].dropna().astype(str))
     palette = model_palette(models)
     for metric, filename, ylabel in [
@@ -1063,7 +1993,7 @@ def write_resource_level_plots(metrics_df, output_dir: Path):
             x="resource_level",
             y=metric,
             hue="model",
-            col="dataset",
+            col="dataset_label",
             col_wrap=3,
             kind="bar",
             order=levels,
@@ -1100,6 +2030,9 @@ def format_speedup(value: float, best: bool = False) -> str:
     return formatted
 
 
+RUNTIME_BASELINE_MODELS = ["Resiliparse", "FastText"]
+
+
 def speedup_column_name(model: str) -> str:
     return f"speedup_vs_{safe_name(model).lower()}"
 
@@ -1109,7 +2042,6 @@ def build_runtime_speedup_table(runtime_df):
     from .plots import ordered_models
 
     rows = []
-    models = ordered_models(runtime_df["model"].dropna().astype(str))
     for dataset, group in runtime_df.groupby("dataset", sort=True):
         mean_by_model = {
             record.model: float(record.mean_seconds)
@@ -1118,20 +2050,28 @@ def build_runtime_speedup_table(runtime_df):
         }
         for model in ordered_models(group["model"].dropna().astype(str)):
             model_mean = mean_by_model.get(model)
+            docs_per_second = math.nan
+            model_rows = group[group["model"].astype(str) == model]
+            if not model_rows.empty and "docs_per_second" in model_rows.columns:
+                docs_per_second = float(model_rows.iloc[0]["docs_per_second"])
             row = {
                 "dataset": dataset,
                 "model": model,
                 "mean_seconds": model_mean if model_mean is not None else math.nan,
+                "mean_ms": model_mean * 1000 if model_mean is not None else math.nan,
+                "docs_per_second": docs_per_second,
             }
-            for comparison_model in models:
+            for comparison_model in RUNTIME_BASELINE_MODELS:
                 comparison_mean = mean_by_model.get(comparison_model)
                 if model_mean is None or comparison_mean is None:
                     row[speedup_column_name(comparison_model)] = math.nan
+                elif model == comparison_model:
+                    row[speedup_column_name(comparison_model)] = 1.0
                 else:
                     row[speedup_column_name(comparison_model)] = comparison_mean / model_mean
             rows.append(row)
 
-    return pd.DataFrame(rows), models
+    return pd.DataFrame(rows), RUNTIME_BASELINE_MODELS
 
 
 def write_runtime_speedup_table(runtime_df, tables_dir: Path):
@@ -1142,23 +2082,18 @@ def write_runtime_speedup_table(runtime_df, tables_dir: Path):
     log("saved", f"runtime speedup csv: {csv_path}")
 
     best_lookup = {}
-    for (dataset, comparison_model), group in [
-        ((dataset, comparison_model), group)
-        for dataset, dataset_group in speedup_df.groupby("dataset", sort=True)
-        for comparison_model in models
-        for group in [dataset_group]
-    ]:
-        column = speedup_column_name(comparison_model)
-        best_lookup[(dataset, comparison_model)] = group[column].max(skipna=True)
+    for dataset, group in speedup_df.groupby("dataset", sort=True):
+        comparable = group[~group["model"].astype(str).isin({"URL"})]
+        for comparison_model in models:
+            column = speedup_column_name(comparison_model)
+            best_lookup[(dataset, comparison_model)] = comparable[column].max(skipna=True)
 
     tex_path = tables_dir / "runtime_speedup_comparison.tex"
     with open(tex_path, "w", encoding="utf-8") as handle:
-        handle.write(r"\begin{tabular}{ll" + "r" * len(models) + "}" + "\n")
+        handle.write(r"\begin{tabular}{llrrrr}" + "\n")
         handle.write(r"\toprule" + "\n")
         handle.write(
-            "Dataset & Model & "
-            + " & ".join(f"vs {latex_escape(model)}" for model in models)
-            + r" \\"
+            r"Dataset & Model & Mean (ms) & Docs/s & Speedup vs Resiliparse & Speedup vs FastText \\"
             + "\n"
         )
         handle.write(r"\midrule" + "\n")
@@ -1167,18 +2102,22 @@ def write_runtime_speedup_table(runtime_df, tables_dir: Path):
         for record in speedup_df.itertuples(index=False):
             if previous_dataset is not None and previous_dataset != record.dataset:
                 handle.write(r"\midrule" + "\n")
-            dataset_label = latex_escape(record.dataset) if previous_dataset != record.dataset else ""
+            dataset_label = latex_escape(dataset_display_label(record.dataset)) if previous_dataset != record.dataset else ""
             previous_dataset = record.dataset
 
-            values = []
+            values = [
+                f"{float(record.mean_ms):.3f}" if not math.isnan(float(record.mean_ms)) else "n/a",
+                f"{float(record.docs_per_second):.1f}" if not math.isnan(float(record.docs_per_second)) else "n/a",
+            ]
             for comparison_model in models:
                 column = speedup_column_name(comparison_model)
                 value = float(getattr(record, column))
-                best = math.isclose(
-                    value,
-                    float(best_lookup[(record.dataset, comparison_model)]),
-                    rel_tol=1e-12,
-                    abs_tol=1e-12,
+                best_value = best_lookup[(record.dataset, comparison_model)]
+                best = (
+                    record.model not in {"URL"}
+                    and not math.isnan(value)
+                    and not math.isnan(float(best_value))
+                    and math.isclose(value, float(best_value), rel_tol=1e-12, abs_tol=1e-12)
                 )
                 values.append(format_speedup(value, best))
 
@@ -1230,7 +2169,7 @@ def write_runtime_outputs(runtime_df, output_dir: Path):
         for record in table_df.itertuples(index=False):
             if previous_dataset is not None and previous_dataset != record.dataset:
                 handle.write(r"\midrule" + "\n")
-            dataset_label = latex_escape(record.dataset) if previous_dataset != record.dataset else ""
+            dataset_label = latex_escape(dataset_display_label(record.dataset)) if previous_dataset != record.dataset else ""
             previous_dataset = record.dataset
             best = math.isclose(
                 float(record.mean_seconds),
@@ -1262,10 +2201,11 @@ def write_runtime_outputs(runtime_df, output_dir: Path):
     log("runtime", "mean_seconds")
     models = ordered_models(table_df["model"].dropna().astype(str))
     palette = model_palette(models)
-    fig, ax = plt.subplots(figsize=(max(8.0, 1.25 * table_df["dataset"].nunique()), 4.8))
+    table_df = table_df.assign(dataset_label=table_df["dataset"].map(dataset_display_label))
+    fig, ax = plt.subplots(figsize=(max(8.0, 1.25 * table_df["dataset_label"].nunique()), 4.8))
     sns.barplot(
         data=table_df,
-        x="dataset",
+        x="dataset_label",
         y="mean_seconds",
         hue="model",
         hue_order=models,
@@ -1302,12 +2242,20 @@ def write_text_length_plots(length_sweep_paths: dict[str, Path], output_dir: Pat
             continue
         dataset_dir = text_length_dir / safe_name(dataset)
         dataset_dir.mkdir(parents=True, exist_ok=True)
+        if not has_url_metadata(dataset):
+            length_df = length_df[~length_df["model"].map(is_url_model)].copy()
+        length_df = length_df[length_df["model"].isin(TEXT_LENGTH_PLOT_MODELS)].copy()
+        if length_df.empty:
+            log("skip", f"{dataset}: no supported text-length plot models")
+            continue
         plot_length_comparison(length_df, dataset, dataset_dir)
         log("saved", f"length plots: {dataset_dir}")
 
 
 def write_language_similarity_outputs(similarity_df, output_dir: Path):
     import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
     import seaborn as sns
 
     if similarity_df is None or similarity_df.empty:
@@ -1322,10 +2270,29 @@ def write_language_similarity_outputs(similarity_df, output_dir: Path):
 
     similarity_dir = output_dir / LANGUAGE_SIMILARITY_DIRNAME
     similarity_dir.mkdir(parents=True, exist_ok=True)
+    gap_summary = summarize_oop_gap_correctness(similarity_df)
+    if gap_summary.empty:
+        log("skip", "similarity: no valid OOP gap rows for correctness table")
+    else:
+        summary_csv = similarity_dir / "oop_score_gap_correctness_summary.csv"
+        summary_tex = similarity_dir / "oop_score_gap_correctness_summary.tex"
+        gap_summary.to_csv(summary_csv, index=False)
+        write_oop_gap_correctness_table(gap_summary, summary_tex, include_dataset=True)
+        log("saved", f"similarity: {summary_csv}")
+        log("saved", f"similarity: {summary_tex}")
 
     for dataset, group in similarity_df.groupby("dataset", sort=True):
         dataset_dir = similarity_dir / safe_name(dataset)
         dataset_dir.mkdir(parents=True, exist_ok=True)
+        if not gap_summary.empty:
+            dataset_gap_summary = gap_summary[gap_summary["dataset"] == dataset].copy()
+            if not dataset_gap_summary.empty:
+                dataset_csv = dataset_dir / "oop_score_gap_correctness_table.csv"
+                dataset_tex = dataset_dir / "oop_score_gap_correctness_table.tex"
+                dataset_gap_summary.to_csv(dataset_csv, index=False)
+                write_oop_gap_correctness_table(dataset_gap_summary, dataset_tex, include_dataset=False)
+                log("saved", f"similarity: {dataset_csv}")
+                log("saved", f"similarity: {dataset_tex}")
         valid = group[
             (~group["lang_distance_invalid"].astype(bool))
             & group["lang_distance"].notna()
@@ -1386,6 +2353,114 @@ def write_language_similarity_outputs(similarity_df, output_dir: Path):
         fig.savefig(output_path, bbox_inches="tight")
         plt.close(fig)
         log("saved", f"similarity: {output_path}")
+
+        gap_valid = group[
+            (~group["oop_gap_invalid"].astype(bool))
+            & group["rank_1_rank_2_oop_gap"].notna()
+            & group["rank_correctness"].notna()
+        ].copy()
+        if gap_valid.empty:
+            log("skip", f"{dataset}: no valid rank-1/rank-2 OOP gap rows")
+        else:
+            gap_valid["rank_1_rank_2_oop_gap"] = pd.to_numeric(
+                gap_valid["rank_1_rank_2_oop_gap"],
+                errors="coerce",
+            )
+            gap_valid = gap_valid.dropna(subset=["rank_1_rank_2_oop_gap"])
+            distance_gap_valid = group[
+                (~group["lang_distance_invalid"].astype(bool))
+                & (~group["oop_gap_invalid"].astype(bool))
+                & group["lang_distance"].notna()
+                & group["rank_1_rank_2_oop_gap"].notna()
+                & group["rank_correctness"].notna()
+            ].copy()
+            distance_gap_valid["rank_1_rank_2_oop_gap"] = pd.to_numeric(
+                distance_gap_valid["rank_1_rank_2_oop_gap"],
+                errors="coerce",
+            )
+            distance_gap_valid = distance_gap_valid.dropna(subset=["rank_1_rank_2_oop_gap"])
+            if distance_gap_valid.empty:
+                log("skip", f"{dataset}: no valid binned distance/OOP gap rows")
+            else:
+                distance_gap_valid["Distance bucket"] = distance_gap_valid["lang_distance"].map(language_distance_bucket)
+                distance_gap_valid["Distance bucket"] = pd.Categorical(
+                    distance_gap_valid["Distance bucket"],
+                    categories=LANG_DISTANCE_BUCKETS,
+                    ordered=True,
+                )
+                present_buckets = [
+                    bucket
+                    for bucket in LANG_DISTANCE_BUCKETS
+                    if bucket in set(distance_gap_valid["Distance bucket"].dropna().astype(str))
+                ]
+                present_correctness = [
+                    label
+                    for label in RANK_CORRECTNESS_ORDER
+                    if label in set(distance_gap_valid["rank_correctness"])
+                ]
+                fig, ax = plt.subplots(figsize=(7.2, 4.8))
+                sns.pointplot(
+                    data=distance_gap_valid,
+                    x="Distance bucket",
+                    y="rank_1_rank_2_oop_gap",
+                    hue="rank_correctness",
+                    order=present_buckets,
+                    hue_order=present_correctness,
+                    estimator=np.median,
+                    errorbar=None,
+                    dodge=0.35,
+                    markers=["o", "s", "^", "D"][: len(present_correctness)],
+                    linestyles=["-", "--", ":", "-."][: len(present_correctness)],
+                    ax=ax,
+                )
+                ax.set_xlabel("Language distance bucket: Resiliparse rank 1 vs rank 2")
+                ax.set_ylabel("Median OOP score gap: rank 2 minus rank 1")
+                ax.set_title(f"{dataset} - OOP gap by discrete language distance")
+                ax.grid(axis="y", linestyle=":", linewidth=0.7, alpha=0.7)
+                legend = ax.get_legend()
+                if legend is not None:
+                    legend.set_title("Correct rank")
+                    legend.get_frame().set_alpha(0.92)
+                fig.tight_layout()
+                output_path = dataset_dir / "oop_gap_by_language_distance_bin.pdf"
+                fig.savefig(output_path, bbox_inches="tight")
+                plt.close(fig)
+                log("saved", f"similarity: {output_path}")
+
+            present_order = [label for label in RANK_CORRECTNESS_ORDER if label in set(gap_valid["rank_correctness"])]
+            fig, ax = plt.subplots(figsize=(7.2, 4.8))
+            sns.boxplot(
+                data=gap_valid,
+                x="rank_correctness",
+                y="rank_1_rank_2_oop_gap",
+                order=present_order,
+                color="#d8e6f3",
+                width=0.55,
+                showfliers=False,
+                ax=ax,
+            )
+            sns.stripplot(
+                data=gap_valid,
+                x="rank_correctness",
+                y="rank_1_rank_2_oop_gap",
+                order=present_order,
+                color="#24476b",
+                alpha=0.36,
+                size=3.0,
+                jitter=0.22,
+                ax=ax,
+            )
+            ax.axhline(0, color="#333333", linewidth=0.9, linestyle=":")
+            ax.set_xlabel("Correct Resiliparse rank")
+            ax.set_ylabel("OOP score gap: rank 2 minus rank 1")
+            ax.set_title(f"{dataset} - Rank-1/rank-2 OOP score gap by correctness")
+            ax.grid(axis="y", linestyle=":", linewidth=0.7, alpha=0.7)
+            ax.tick_params(axis="x", rotation=12)
+            fig.tight_layout()
+            output_path = dataset_dir / "oop_score_gap_by_rank_correctness.pdf"
+            fig.savefig(output_path, bbox_inches="tight")
+            plt.close(fig)
+            log("saved", f"similarity: {output_path}")
 
         wrong = valid[~valid["is_correct"].astype(bool)].copy()
         if wrong.empty:
@@ -1637,25 +2712,32 @@ def main(argv=None):
 
     metrics_df, confusion_df = load_or_derive_inputs(args)
     log("write", "normalized tables and artifacts")
+    runtime_df = None
+    rp_output_paths = None
+    if not args.normalized_only and not args.generate_demo_data:
+        rp_output_paths = parse_rp_output_overrides(args.rp_output)
+        runtime_df = derive_runtime_from_rp_outputs(rp_output_paths, args.hybrid_cutoff)
     write_normalized_tables(metrics_df, confusion_df, output_dir)
     write_baseline_table(metrics_df, output_dir)
-    write_model_dataset_summary(confusion_df, output_dir)
+    write_model_dataset_summary(confusion_df, output_dir, runtime_df)
     write_resource_level_summary_table(metrics_df, output_dir)
     write_resource_level_plots(metrics_df, output_dir)
     if args.normalized_only or args.generate_demo_data:
         log("skip", "extended model summary: requires rp_outputs.csv routing columns")
         log("skip", "runtime: requires rp_outputs.csv timing columns")
         log("skip", "similarity: requires rp_outputs.csv language columns")
+        confusion_for_matrices = confusion_df
     else:
-        rp_output_paths = parse_rp_output_overrides(args.rp_output)
         extended_confusion_df = derive_extended_confusion_from_rp_outputs(rp_output_paths, args.hybrid_cutoff)
         write_model_dataset_summary_extended(extended_confusion_df, output_dir)
-        runtime_df = derive_runtime_from_rp_outputs(rp_output_paths, args.hybrid_cutoff)
+        write_url_model_evaluation_table(rp_output_paths, output_dir, args.hybrid_cutoff)
         write_runtime_outputs(runtime_df, output_dir)
         similarity_df = derive_language_similarity_from_rp_outputs(rp_output_paths)
         write_language_similarity_outputs(similarity_df, output_dir)
+        confusion_for_matrices = extended_confusion_df if not extended_confusion_df.empty else confusion_df
+    write_summary_plots(output_dir)
     write_text_length_plots(parse_length_sweep_overrides(args.length_sweep), output_dir)
-    write_confusion_matrices(confusion_df, output_dir)
+    write_confusion_matrices(confusion_for_matrices, output_dir)
 
     log("done", "publication visuals complete")
 

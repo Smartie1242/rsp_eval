@@ -33,7 +33,12 @@ Examples:
         default="commonlid",
         help="Dataset extractor type.",
     )
-    parser.add_argument("--split", type=str, default="train", help="Dataset split to use.")
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=None,
+        help="Dataset split to use. Defaults to test for CommonLID and train for local split datasets.",
+    )
     parser.add_argument("--local", action="store_true", help="Treat --dataset as a local file/directory.")
     return parser
 
@@ -80,6 +85,7 @@ def process_owi_directory(args, extractor, dataset_path: Path):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    split = args.split or ("test" if args.extractor == "commonlid" else "train")
     print(f"Using extractor: {args.extractor}")
     extractor = get_extractor(args.extractor)
 
@@ -91,13 +97,13 @@ def main(argv=None):
 
         dataset_name = dataset_name_for(args.extractor, args.dataset)
         print(f"Loading local dataset: {dataset_name}")
-        dataset = load_local_dataset(args.dataset, args.extractor, split=args.split)
+        dataset = load_local_dataset(args.dataset, args.extractor, split=split)
     else:
         from datasets import load_dataset
 
         dataset_name = dataset_name_for(args.extractor, args.dataset)
-        print(f"Loading dataset: {dataset_name} (split: {args.split})")
-        dataset = load_dataset(args.dataset)[args.split]
+        print(f"Loading dataset: {dataset_name} (split: {split})")
+        dataset = load_dataset(args.dataset)[split]
 
     print(f"\nGenerating outputs (n_results={args.n_results})...")
     output_path = output_path_for(args, dataset_name)
